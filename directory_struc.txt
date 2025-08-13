@@ -1,0 +1,19 @@
+draupnir_app/
+├─ venv/                         # your virtual env (optional but recommended)
+├─ data/
+│  └─ draupnir.db               # SQLite file lives here
+├─ exports/                      # Excel exports land here (holdings, trades, forecasts)
+├─ draupnir_core/                # Python package with your modules
+│  ├─ __init__.py
+│  ├─ settings.py
+│  ├─ portfolio.py
+│  ├─ trades.py
+│  ├─ summary.py
+│  ├─ forecast.py
+│  ├─ forecast_engine.py
+│  ├─ draupnir.py
+│  ├─ tax_engine.py
+│  └─ utils.py                   # (ok to keep for legacy helpers)
+├─ app.py                        # Streamlit entrypoint
+├─ requirements.txt
+└─ README.md

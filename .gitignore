@@ -1,0 +1,14 @@
+# Virtual env
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# DB backups or temp files (add if you have them)
+*.bak
+
+# OS files
+.DS_Store
+Thumbs.db
