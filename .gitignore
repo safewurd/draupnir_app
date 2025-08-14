@@ -1,14 +1,21 @@
-# Virtual env
+﻿# Python
+.venv/
 venv/
-
-# Python cache
 __pycache__/
 *.pyc
-*.pyo
 
-# DB backups or temp files (add if you have them)
-*.bak
+# Env & secrets
+.env
+*.key
 
-# OS files
+# IDE/OS
+.vscode/
 .DS_Store
 Thumbs.db
+
+# Data/outputs/build
+*.db
+*.sqlite
+dist/
+build/
+outputs/
