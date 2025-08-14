@@ -19,3 +19,5 @@ Thumbs.db
 dist/
 build/
 outputs/
+
+data/db_local.json

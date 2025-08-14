@@ -2,10 +2,14 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 import os  # for showing absolute paths and ensuring data dir
+from pathlib import Path
 
-# ---- Unified DB path ----
+# NEW: per-machine DB config helper
+from draupnir_core.db_config import get_db_path, set_db_path_local, clear_db_path_local
+
+# ---- Unified DB path (now resolved per machine) ----
 os.makedirs("data", exist_ok=True)
-DB_PATH = os.path.join("data", "draupnir.db")
+DB_PATH = get_db_path()  # <-- absolute path for THIS machine
 
 # ---------- Default Option Lists ----------
 BASE_CURRENCY_OPTIONS = ["CAD", "USD"]
@@ -185,10 +189,40 @@ def insert_portfolio(owner: str, institution: str, tax_treatment: str, account_n
 
 # ---------- UI Tab ----------
 def settings_tab():
-    st.subheader("⚙️ Global Settings")
-
+    
     create_settings_tables()
     settings = get_settings()
+
+    # --- NEW: Database Location (this machine only) ---
+    st.markdown("### 📦 Database Location (this machine)")
+    st.caption("Set where this computer should read/write the SQLite DB. Not committed to Git.")
+    st.text_input("Current DB path", value=str(DB_PATH), disabled=True)
+
+    colA, colB = st.columns(2)
+    with colA:
+        new_path = st.text_input(
+            "Set DB file path (absolute path or dropbox://Apps/draupnir/data/draupnir.db)",
+            placeholder=r"N:\Dropbox\Apps\draupnir\data\draupnir.db  or  dropbox://Apps/draupnir/data/draupnir.db"
+        )
+        copy_first = st.checkbox("If target is new, copy current DB there once", value=True)
+        if st.button("💾 Use This Path (This Machine Only)"):
+            try:
+                resolved = set_db_path_local(new_path.strip(), copy_if_needed=copy_first)
+                st.success(f"DB path saved for this machine:\n{resolved}")
+                st.info("Restart app or reload page to apply.")
+            except Exception as e:
+                st.error(f"Failed to set DB path: {e}")
+
+    with colB:
+        if st.button("↩️ Switch Back to Local (data/draupnir.db)"):
+            try:
+                clear_db_path_local()
+                st.success("Switched to local DB: data/draupnir.db")
+                st.info("Restart app or reload page to apply.")
+            except Exception as e:
+                st.error(f"Failed to clear local DB override: {e}")
+
+    st.divider()
 
     # --- Editable Global Settings ---
     st.markdown("### 🌍 Projection Defaults")
