@@ -1,0 +1,4 @@
+portfolio_id,account_number,portfolio_name,portfolio_owner,institution,created_at,tax_treatment
+1,654321,Ryan Neske - RBCDI - Taxable - 654321,Ryan Neske,RBCDI,2025-07-29 15:32:43,Taxable
+2,654322,Jennifer Neske - RBCDI - Taxable - 654322,Jennifer Neske,RBCDI,2025-07-29 15:32:43,Taxable
+4,654326,Ryan Neske - RBCDI - Taxable - 654326,Ryan Neske,RBCDI,2025-08-09 01:12:55,Taxable

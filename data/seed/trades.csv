@@ -1,0 +1,5 @@
+trade_id,trade_date,portfolio_name,portfolio_id,account_number,ticker,currency,action,quantity,price,commission,fees,notes,exchange,yahoo_symbol,created_at
+4,2025-08-07,Ryan Neske - RBCDI - Taxable - 654321,1,654321,RY,CAD,BUY,35000.0,150.0,0.0,0.0,,,RY.TO,2025-08-08T03:23:56Z
+5,2025-08-07,Ryan Neske - RBCDI - Taxable - 654321,1,654321,NEO,CAD,BUY,10000.0,15.0,0.0,0.0,,,NEO.TO,2025-08-08T03:27:35Z
+6,2025-08-07,Jennifer Neske - RBCDI - Taxable - 654322,2,654322,MP,USD,BUY,10000.0,50.0,0.0,0.0,,,MP,2025-08-08T03:29:34Z
+9,2025-08-12,Ryan Neske - RBCDI - Taxable - 654326,4,654326,MAL,CAD,BUY,1000.0,16.0,9.99,,,,MAL.TO,2025-08-12T12:26:20Z
