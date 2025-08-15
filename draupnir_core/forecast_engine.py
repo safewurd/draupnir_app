@@ -2,13 +2,10 @@
 """
 Forecast Engine (callable)
 
-Enhancement C:
-- Option to seed starting assets from CURRENT HOLDINGS (derived from trades)
+- Seeds starting assets from CURRENT HOLDINGS (derived from trades) or Assets
 - Choice of valuation basis: "market" (live-price) or "book"
 - Maps portfolios → tax_treatment automatically via portfolios table
-
-Also retains Feature A (portfolio_flows) and the rest of the engine.
-Imports for draupnir/tax_engine are robust whether they live in the package or root.
+- Uses portfolio_flows ONLY (ProjectionInputs removed)
 """
 
 from __future__ import annotations
@@ -60,9 +57,9 @@ class ForecastParams:
     fx_mode: Optional[str] = None
     notes: Optional[str] = None
 
-    # Enhancement C:
-    seed_from_holdings: bool = False                  # if True, ignore Assets table and derive from trades
-    holdings_valuation: str = "market"                # "market" or "book"
+    # Seed from holdings
+    seed_from_holdings: bool = False
+    holdings_valuation: str = "market"  # "market" or "book"
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -90,9 +87,6 @@ def _load_df(conn: sqlite3.Connection, sql: str, params: Tuple = ()) -> pd.DataF
         return pd.DataFrame()
 
 def _load_global_settings(conn: sqlite3.Connection) -> Dict[str, Any]:
-    """
-    Read key/value pairs from global_settings table. Never crashes; returns {} on error.
-    """
     try:
         if not _table_exists(conn, "global_settings"):
             return {}
@@ -105,11 +99,6 @@ def load_assets(conn: sqlite3.Connection) -> pd.DataFrame:
     if not _table_exists(conn, "Assets"):
         return pd.DataFrame()
     return _load_df(conn, "SELECT * FROM Assets")
-
-def load_projection_inputs(conn: sqlite3.Connection) -> pd.DataFrame:
-    if not _table_exists(conn, "ProjectionInputs"):
-        return pd.DataFrame()
-    return _load_df(conn, "SELECT * FROM ProjectionInputs")
 
 def load_macro_forecast(conn: sqlite3.Connection) -> pd.DataFrame:
     if not _table_exists(conn, "MacroForecast"):
@@ -130,7 +119,7 @@ def ensure_portfolio_flows_table(conn: sqlite3.Connection) -> None:
             amount REAL NOT NULL,                -- amount in portfolio currency
             frequency TEXT NOT NULL,             -- 'monthly' or 'annual'
             start_date TEXT NOT NULL,            -- 'YYYY-MM-01'
-            end_date TEXT,                       -- nullable; if NULL, open-ended
+            end_date TEXT,                       -- nullable
             index_with_inflation INTEGER NOT NULL DEFAULT 1, -- 1/0
             notes TEXT,
             created_at TEXT DEFAULT (datetime('now'))
@@ -148,7 +137,7 @@ def load_portfolio_flows(conn: sqlite3.Connection) -> pd.DataFrame:
     """)
 
 # -----------------------------
-# Enhancement C: build assets from holdings
+# Build assets from holdings
 # -----------------------------
 
 def _load_trades(conn: sqlite3.Connection) -> pd.DataFrame:
@@ -218,11 +207,6 @@ def _fetch_prices(symbols: Iterable[str]) -> Dict[str, Optional[float]]:
     return out
 
 def _holdings_to_assets(conn: sqlite3.Connection, valuation: str = "market") -> pd.DataFrame:
-    """
-    Build starting assets per portfolio from current holdings. If valuation='market',
-    we use live prices where available and **fall back to book_value** where prices
-    are missing to avoid zero starts.
-    """
     trades = _load_trades(conn)
     if trades.empty:
         return pd.DataFrame()
@@ -238,7 +222,6 @@ def _holdings_to_assets(conn: sqlite3.Connection, valuation: str = "market") -> 
             lambda r: (r["current_qty"] * r["live_price"]) if pd.notna(r.get("live_price")) else None,
             axis=1
         )
-        # Fallback to book_value where market price is missing
         pos["mkt_or_book"] = pos["mkt_value"].where(pos["mkt_value"].notna(), pos["book_value"])
         per_pf = pos.groupby(["portfolio_id","portfolio_name"], dropna=False)["mkt_or_book"].sum(min_count=1).reset_index()
         per_pf = per_pf.rename(columns={"mkt_or_book":"starting_value"})
@@ -255,7 +238,7 @@ def _holdings_to_assets(conn: sqlite3.Connection, valuation: str = "market") -> 
     return per_pf
 
 # -----------------------------
-# Flows → monthly inputs (Feature A)
+# Flows → monthly inputs (ProjectionInputs removed)
 # -----------------------------
 
 def _flows_to_monthly_inputs(flows: pd.DataFrame) -> pd.DataFrame:
@@ -288,7 +271,9 @@ def _flows_to_monthly_inputs(flows: pd.DataFrame) -> pd.DataFrame:
     )
 
     out = pd.DataFrame({"portfolio_id": sorted(set(f["portfolio_id"].tolist()))})
-    out = out.merge(contrib, on="portfolio_id", how="left").merge(withd, on="portfolio_id", how="left").merge(infl, on="portfolio_id", how="left")
+    out = out.merge(contrib, on="portfolio_id", how="left") \
+             .merge(withd,  on="portfolio_id", how="left") \
+             .merge(infl,   on="portfolio_id", how="left")
     out = out.fillna({"monthly_contribution": 0.0, "monthly_withdrawal": 0.0, "index_with_inflation": 1})
     return out
 
@@ -309,43 +294,32 @@ def run_forecast(
 
     conn = _connect(db_path)
     try:
-        # Use DB-driven global settings (avoid utils signature mismatches)
+        # Global settings
         settings = _load_global_settings(conn)
 
-        # Apply per-run overrides if supplied
+        # Per-run overrides
         for k in ("inflation_mode", "growth_mode", "fx_mode"):
             v = getattr(fp, k)
             if v:
                 settings[k] = str(v).lower()
 
-        # Seed assets (holdings or legacy Assets table)
+        # Seed assets
         if fp.seed_from_holdings:
             assets_df = _holdings_to_assets(conn, valuation=fp.holdings_valuation)
         else:
             assets_df = load_assets(conn)
 
-        inputs_df   = load_projection_inputs(conn)
-        macro_df    = load_macro_forecast(conn) if fp.use_macro else pd.DataFrame()
-        income_df   = load_employment_income(conn)
+        macro_df  = load_macro_forecast(conn) if fp.use_macro else pd.DataFrame()
+        income_df = load_employment_income(conn)
 
-        # Portfolio flows → monthly inputs
+        # Portfolio flows (single source of truth)
         flows_df = load_portfolio_flows(conn)
-        flows_inputs = _flows_to_monthly_inputs(flows_df)
-        if not flows_inputs.empty:
-            if inputs_df is None or inputs_df.empty:
-                inputs_df = flows_inputs.copy()
-            else:
-                if "portfolio_id" in inputs_df.columns:
-                    inputs_df = inputs_df.merge(flows_inputs, on="portfolio_id", how="left")
-                else:
-                    inputs_df = inputs_df.copy()
-                    inputs_df["portfolio_id"] = None
-                    inputs_df = inputs_df.merge(flows_inputs, on="portfolio_id", how="left")
-            for c, v in [("monthly_contribution", 0.0), ("monthly_withdrawal", 0.0), ("index_with_inflation", 1)]:
-                if c in inputs_df.columns:
-                    inputs_df[c] = pd.to_numeric(inputs_df[c], errors="coerce").fillna(v)
+        inputs_df = _flows_to_monthly_inputs(flows_df)
+        # Ensure expected columns exist even if empty
+        if inputs_df.empty:
+            inputs_df = pd.DataFrame(columns=["portfolio_id","monthly_contribution","monthly_withdrawal","index_with_inflation"])
 
-        macro_rates = get_macro_rates(macro_df, settings, inputs_df)
+        macro_rates  = get_macro_rates(macro_df, settings, inputs_df)
         infl_factors = build_inflation_factors(macro_rates, settings, inputs_df)
 
         monthly_df = simulate_portfolio_growth(
