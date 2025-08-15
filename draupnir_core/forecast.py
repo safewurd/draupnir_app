@@ -66,14 +66,10 @@ def _export_excel_ui(monthly_df: pd.DataFrame, annual_df: pd.DataFrame, run_id: 
     if save_disabled:
         st.caption("Tip: set a **Forecast Output Directory** in Settings to enable server-side save.")
     if st.button("Save to Output Directory", key="btn_save_forecast_excel", disabled=save_disabled):
-        if monthly_df is None or monthly_df.empty:
-            st.error("No monthly data to export.")
-            return
-        if annual_df is None or annual_df.empty:
-            st.error("No annual data to export.")
+        if monthly_df is None or monthly_df.empty or annual_df is None or annual_df.empty:
+            st.error("No data to export.")
             return
 
-        # Build the same workbook bytes
         bio = BytesIO()
         with pd.ExcelWriter(bio, engine="openpyxl") as writer:
             monthly_df.to_excel(writer, index=False, sheet_name="Monthly")
@@ -91,8 +87,6 @@ def _export_excel_ui(monthly_df: pd.DataFrame, annual_df: pd.DataFrame, run_id: 
         bio.seek(0)
         ts = datetime.utcnow().strftime('%Y%m%d_%H%M%SZ')
         fname = f"forecast_run_{(run_id or 0)}_{ts}.xlsx"
-
-        # Ensure directory exists, then write file
         outdir = output_dir.strip()
         try:
             os.makedirs(outdir, exist_ok=True)
@@ -103,7 +97,6 @@ def _export_excel_ui(monthly_df: pd.DataFrame, annual_df: pd.DataFrame, run_id: 
         except Exception as ex:
             st.error(f"Failed to save file: {ex}")
 
-    # If user prepared the in-memory workbook, show a download button
     if not st.session_state.get("export_forecast_ready"):
         return
 
@@ -134,7 +127,7 @@ def _export_excel_ui(monthly_df: pd.DataFrame, annual_df: pd.DataFrame, run_id: 
     )
 
 # -----------------------------
-# Cash Flows CRUD (Feature A)
+# Cash Flows CRUD (unchanged)
 # -----------------------------
 
 def _ensure_flows_table():
@@ -185,7 +178,7 @@ def _load_flows_for_portfolio(pid: int) -> pd.DataFrame:
         conn.close()
 
 # -----------------------------
-# Assumptions Editor (Feature B)
+# Assumptions editor + Runner UI (unchanged flow)
 # -----------------------------
 
 def _ensure_macro_table():
@@ -238,14 +231,17 @@ def _save_generic_table(name: str, df: pd.DataFrame):
     finally:
         conn.close()
 
-# -----------------------------
-# UI
-# -----------------------------
+def _load_portfolios():
+    conn = _connect(DB_PATH)
+    try:
+        return pd.read_sql("SELECT portfolio_id, portfolio_name FROM portfolios ORDER BY portfolio_name;", conn)
+    finally:
+        conn.close()
 
 def forecast_tab():
     st.subheader("🔮 Forecast")
 
-    # ========== A) Cash Flows by Portfolio (CRUD) ==========
+    # A) Cash Flows
     st.markdown("### 💵 Cash Flows by Portfolio")
     _ensure_flows_table()
 
@@ -300,7 +296,6 @@ def forecast_tab():
     flows_df = _load_flows_for_portfolio(sel_pid)
     if not flows_df.empty:
         st.dataframe(flows_df, use_container_width=True, hide_index=True)
-        # Delete control
         del_col1, del_col2 = st.columns([2, 1])
         with del_col1:
             del_opt = st.selectbox("Select a flow to delete", options=[
@@ -319,17 +314,12 @@ def forecast_tab():
 
     st.markdown("---")
 
-    # ========== B) Assumptions Editor ==========
+    # B) Assumptions
     st.markdown("## 🧭 Assumptions")
 
-    # -- Macro Forecast table editor
     st.markdown("### 📈 Macro Forecast")
     _ensure_macro_table()
     macro_df = _load_generic_table("MacroForecast")
-
-    st.caption("Tip: include columns your engine expects (e.g., year, inflation, growth, fx). "
-               "This editor is schema-agnostic and will preserve whatever columns you use.")
-
     macro_edit = st.data_editor(
         macro_df if not macro_df.empty else pd.DataFrame(columns=["year","inflation","growth","fx","note"]),
         num_rows="dynamic",
@@ -353,11 +343,9 @@ def forecast_tab():
 
     st.markdown("---")
 
-    # -- Employment Income table editor
     st.markdown("### 💼 Employment Income")
     _ensure_employment_table()
     emp_df = _load_generic_table("EmploymentIncome")
-
     emp_edit = st.data_editor(
         emp_df if not emp_df.empty else pd.DataFrame(columns=["year","amount","employer","note"]),
         num_rows="dynamic",
@@ -380,7 +368,7 @@ def forecast_tab():
 
     st.markdown("---")
 
-    # ========== C) Minimal Forecast Runner ==========
+    # C) Run Forecast
     st.markdown("### ▶️ Run Forecast")
     with st.form("forecast_form"):
         col1, col2, col3 = st.columns(3)
@@ -443,12 +431,12 @@ def forecast_tab():
                f"growth={params.get('growth_mode') or 'global'}, "
                f"fx={params.get('fx_mode') or 'global'}.")
 
-    # Previews
+    # Previews (note: Monthly now starts with t0 row)
     st.markdown("#### Monthly Results (preview)")
     _maybe_show_table("", monthly_df)
 
     st.markdown("#### Annual After-Tax Results (preview)")
     _maybe_show_table("", annual_df)
 
-    # Export (Download + Save-to-dir)
+    # Export
     _export_excel_ui(monthly_df, annual_df, run_id)

@@ -1,27 +1,19 @@
-# delete_portfolio_3.py
-
 import sqlite3
+from draupnir_core.db_config import get_db_path
 
-DB_PATH = "draupnir.db"
-PORTFOLIO_ID_TO_DELETE = 3
+DB_PATH = get_db_path()
 
-def delete_portfolio_and_trades(db_path, portfolio_id):
+def clear_portfolio_flows(db_path: str):
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
-
-    # Delete trades first to avoid foreign key constraints (if enabled)
-    cur.execute("DELETE FROM trades WHERE portfolio_id = ?", (portfolio_id,))
-    trades_deleted = cur.rowcount
-
-    # Delete the portfolio
-    cur.execute("DELETE FROM portfolios WHERE portfolio_id = ?", (portfolio_id,))
-    portfolios_deleted = cur.rowcount
-
+    try:
+        cur.execute("DELETE FROM portfolio_flows")
+        print(f"✅ Cleared portfolio_flows ({cur.rowcount} rows)")
+    except sqlite3.OperationalError as e:
+        print(f"⚠️ portfolio_flows table not found: {e}")
     conn.commit()
     conn.close()
 
-    print(f"✅ Deleted {trades_deleted} trades and {portfolios_deleted} portfolio row(s) for portfolio_id = {portfolio_id}")
-
 if __name__ == "__main__":
-    delete_portfolio_and_trades(DB_PATH, PORTFOLIO_ID_TO_DELETE)
-
+    print(f"Using DB: {DB_PATH}")
+    clear_portfolio_flows(DB_PATH)

@@ -62,8 +62,6 @@ pip install -r requirements.txt
 # Example for Streamlit
 streamlit run app.py
 
-# Or for standard Python script
-python app.py
 
 🔄 Daily Workflow
 
