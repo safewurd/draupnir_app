@@ -1,3 +1,4 @@
+# draupnir_core/forecast.py
 import sqlite3
 import os
 from io import BytesIO
@@ -35,14 +36,6 @@ def _load_portfolios() -> pd.DataFrame:
     finally:
         conn.close()
 
-def _maybe_show_table(name: str, df: pd.DataFrame, max_rows: int = 200):
-    if name:
-        st.markdown(f"#### {name}")
-    if df is None or df.empty:
-        st.info("No data.")
-        return
-    st.dataframe(df.head(max_rows), use_container_width=True, hide_index=True)
-
 def _get_setting(key: str) -> str | None:
     conn = _connect(DB_PATH)
     try:
@@ -53,33 +46,96 @@ def _get_setting(key: str) -> str | None:
     finally:
         conn.close()
 
-def _export_excel_ui(monthly_df: pd.DataFrame, annual_df: pd.DataFrame, run_id: int | None):
+# -----------------------------
+# Annual summary builder
+# -----------------------------
+
+def _build_annual_summary(monthly_df: pd.DataFrame, annual_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Output columns (year-level, summed across portfolios):
+      year
+      value_real                -> sum of end-of-year real values across portfolios
+      contributions             -> sum of monthly contributions during the year
+      withdrawals               -> sum of monthly withdrawals during the year
+      pretax_income             -> sum(after_tax_income + taxes_paid) for the year (nominal)
+      real_after_tax_income     -> sum of real_after_tax_income for the year
+      effective_tax_rate        -> taxes_paid / pretax_income  (0 if denom=0)
+    """
+    if monthly_df is None or monthly_df.empty:
+        return pd.DataFrame(columns=[
+            "year","value_real","contributions","withdrawals","pretax_income","real_after_tax_income","effective_tax_rate"
+        ])
+
+    m = monthly_df.copy()
+    m["year"] = pd.to_datetime(m["date"]).dt.year
+
+    # end-of-year real value per portfolio → then sum across portfolios
+    m_sorted = m.sort_values(["year", "portfolio_id", "date"])
+    last_per_pf_year = (
+        m_sorted.groupby(["year", "portfolio_id"], as_index=False)
+        .tail(1)[["year", "portfolio_id", "value_real"]]
+    )
+    end_value_by_year = last_per_pf_year.groupby("year")["value_real"].sum().rename("value_real")
+
+    contrib_by_year = m.groupby("year")["contributions"].sum().rename("contributions")
+    withdr_by_year  = m.groupby("year")["withdrawals"].sum().rename("withdrawals")
+
+    a = annual_df.copy() if annual_df is not None else pd.DataFrame(columns=["year","after_tax_income","real_after_tax_income","taxes_paid"])
+    if not a.empty:
+        a["pretax_income"] = pd.to_numeric(a["after_tax_income"], errors="coerce").fillna(0.0) + \
+                             pd.to_numeric(a["taxes_paid"], errors="coerce").fillna(0.0)
+        a_grp = a.groupby("year").agg(
+            pretax_income=("pretax_income", "sum"),
+            real_after_tax_income=("real_after_tax_income", "sum"),
+            taxes_paid=("taxes_paid", "sum"),
+        )
+    else:
+        a_grp = pd.DataFrame(columns=["pretax_income","real_after_tax_income","taxes_paid"])
+
+    # join all parts
+    years = sorted(set(end_value_by_year.index) | set(contrib_by_year.index) | set(withdr_by_year.index) | set(a_grp.index))
+    out = pd.DataFrame({"year": years}).set_index("year")
+
+    for ser in (end_value_by_year, contrib_by_year, withdr_by_year):
+        out = out.join(ser, how="left")
+
+    out = out.join(a_grp, how="left")
+    out = out.fillna({"value_real": 0.0, "contributions": 0.0, "withdrawals": 0.0,
+                      "pretax_income": 0.0, "real_after_tax_income": 0.0, "taxes_paid": 0.0})
+
+    # effective tax rate
+    denom = out["pretax_income"].replace(0, pd.NA)
+    out["effective_tax_rate"] = (out["taxes_paid"] / denom).fillna(0.0)
+
+    # final order
+    out = out[["value_real","contributions","withdrawals","pretax_income","real_after_tax_income","effective_tax_rate"]]
+    out = out.reset_index()
+    return out
+
+# -----------------------------
+# Export (single sheet: Annual Summary)
+# -----------------------------
+
+def _export_excel_ui(summary_df: pd.DataFrame, run_id: int | None):
     st.markdown("### ⬇️ Export Forecast")
 
-    # Button #1: Prepare in-memory workbook and download
     if st.button("Prepare Excel", key="btn_prepare_forecast_excel", type="secondary"):
         st.session_state["export_forecast_ready"] = True
 
-    # Button #2: Save to Output Directory (server-side)
     output_dir = _get_setting("forecast_output_dir") or ""
     save_disabled = (not output_dir.strip())
     if save_disabled:
         st.caption("Tip: set a **Forecast Output Directory** in Settings to enable server-side save.")
+
     if st.button("Save to Output Directory", key="btn_save_forecast_excel", disabled=save_disabled):
-        if monthly_df is None or monthly_df.empty or annual_df is None or annual_df.empty:
-            st.error("No data to export.")
+        if summary_df is None or summary_df.empty:
+            st.error("No results to export.")
             return
 
         bio = BytesIO()
         with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-            monthly_df.to_excel(writer, index=False, sheet_name="Monthly")
-            ws = writer.sheets["Monthly"]
-            for col_cells in ws.columns:
-                length = max(len(str(cell.value)) if cell.value is not None else 0 for cell in col_cells)
-                ws.column_dimensions[col_cells[0].column_letter].width = min(max(length + 2, 12), 50)
-
-            annual_df.to_excel(writer, index=False, sheet_name="Annual")
-            ws = writer.sheets["Annual"]
+            summary_df.to_excel(writer, index=False, sheet_name="Annual_Summary")
+            ws = writer.sheets["Annual_Summary"]
             for col_cells in ws.columns:
                 length = max(len(str(cell.value)) if cell.value is not None else 0 for cell in col_cells)
                 ws.column_dimensions[col_cells[0].column_letter].width = min(max(length + 2, 12), 50)
@@ -87,10 +143,10 @@ def _export_excel_ui(monthly_df: pd.DataFrame, annual_df: pd.DataFrame, run_id: 
         bio.seek(0)
         ts = datetime.utcnow().strftime('%Y%m%d_%H%M%SZ')
         fname = f"forecast_run_{(run_id or 0)}_{ts}.xlsx"
-        outdir = output_dir.strip()
+
         try:
-            os.makedirs(outdir, exist_ok=True)
-            fpath = os.path.abspath(os.path.join(outdir, fname))
+            os.makedirs(output_dir, exist_ok=True)
+            fpath = os.path.abspath(os.path.join(output_dir, fname))
             with open(fpath, "wb") as f:
                 f.write(bio.getvalue())
             st.success(f"✅ Saved to: `{fpath}`")
@@ -102,18 +158,11 @@ def _export_excel_ui(monthly_df: pd.DataFrame, annual_df: pd.DataFrame, run_id: 
 
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        if monthly_df is not None and not monthly_df.empty:
-            monthly_df.to_excel(writer, index=False, sheet_name="Monthly")
-            ws = writer.sheets["Monthly"]
-            for col_cells in ws.columns:
-                length = max(len(str(cell.value)) if cell.value is not None else 0 for cell in col_cells)
-                ws.column_dimensions[col_cells[0].column_letter].width = min(max(length + 2, 12), 50)
-        if annual_df is not None and not annual_df.empty:
-            annual_df.to_excel(writer, index=False, sheet_name="Annual")
-            ws = writer.sheets["Annual"]
-            for col_cells in ws.columns:
-                length = max(len(str(cell.value)) if cell.value is not None else 0 for cell in col_cells)
-                ws.column_dimensions[col_cells[0].column_letter].width = min(max(length + 2, 12), 50)
+        summary_df.to_excel(writer, index=False, sheet_name="Annual_Summary")
+        ws = writer.sheets["Annual_Summary"]
+        for col_cells in ws.columns:
+            length = max(len(str(cell.value)) if cell.value is not None else 0 for cell in col_cells)
+            ws.column_dimensions[col_cells[0].column_letter].width = min(max(length + 2, 12), 50)
     bio.seek(0)
 
     fname = f"forecast_run_{(run_id or 0)}_{datetime.utcnow().strftime('%Y%m%d_%H%M%SZ')}.xlsx"
@@ -127,7 +176,7 @@ def _export_excel_ui(monthly_df: pd.DataFrame, annual_df: pd.DataFrame, run_id: 
     )
 
 # -----------------------------
-# Cash Flows CRUD (unchanged)
+# Cash Flows CRUD (unchanged helpers)
 # -----------------------------
 
 def _ensure_flows_table():
@@ -178,7 +227,7 @@ def _load_flows_for_portfolio(pid: int) -> pd.DataFrame:
         conn.close()
 
 # -----------------------------
-# Assumptions editor + Runner UI (unchanged flow)
+# Assumptions editors (unchanged)
 # -----------------------------
 
 def _ensure_macro_table():
@@ -231,17 +280,14 @@ def _save_generic_table(name: str, df: pd.DataFrame):
     finally:
         conn.close()
 
-def _load_portfolios():
-    conn = _connect(DB_PATH)
-    try:
-        return pd.read_sql("SELECT portfolio_id, portfolio_name FROM portfolios ORDER BY portfolio_name;", conn)
-    finally:
-        conn.close()
+# -----------------------------
+# UI
+# -----------------------------
 
 def forecast_tab():
     st.subheader("🔮 Forecast")
 
-    # A) Cash Flows
+    # ========== A) Cash Flows by Portfolio (CRUD) ==========
     st.markdown("### 💵 Cash Flows by Portfolio")
     _ensure_flows_table()
 
@@ -296,6 +342,7 @@ def forecast_tab():
     flows_df = _load_flows_for_portfolio(sel_pid)
     if not flows_df.empty:
         st.dataframe(flows_df, use_container_width=True, hide_index=True)
+        # Delete control
         del_col1, del_col2 = st.columns([2, 1])
         with del_col1:
             del_opt = st.selectbox("Select a flow to delete", options=[
@@ -314,12 +361,17 @@ def forecast_tab():
 
     st.markdown("---")
 
-    # B) Assumptions
+    # ========== B) Assumptions Editor ==========
     st.markdown("## 🧭 Assumptions")
 
+    # -- Macro Forecast table editor
     st.markdown("### 📈 Macro Forecast")
     _ensure_macro_table()
     macro_df = _load_generic_table("MacroForecast")
+
+    st.caption("Tip: include columns your engine expects (e.g., year, inflation, growth, fx). "
+               "This editor is schema-agnostic and will preserve whatever columns you use.")
+
     macro_edit = st.data_editor(
         macro_df if not macro_df.empty else pd.DataFrame(columns=["year","inflation","growth","fx","note"]),
         num_rows="dynamic",
@@ -343,9 +395,11 @@ def forecast_tab():
 
     st.markdown("---")
 
+    # -- Employment Income table editor
     st.markdown("### 💼 Employment Income")
     _ensure_employment_table()
     emp_df = _load_generic_table("EmploymentIncome")
+
     emp_edit = st.data_editor(
         emp_df if not emp_df.empty else pd.DataFrame(columns=["year","amount","employer","note"]),
         num_rows="dynamic",
@@ -368,7 +422,7 @@ def forecast_tab():
 
     st.markdown("---")
 
-    # C) Run Forecast
+    # ========== C) Forecast Runner ==========
     st.markdown("### ▶️ Run Forecast")
     with st.form("forecast_form"):
         col1, col2, col3 = st.columns(3)
@@ -411,6 +465,9 @@ def forecast_tab():
                     inflation_mode=infl_mode,
                     growth_mode=gr_mode,
                     fx_mode=fx_mode,
+                    # 🔑 NEW: seed from current holdings at market (fallback to book in engine)
+                    seed_from_holdings=True,
+                    holdings_valuation="market",
                 ),
                 write_to_db=True,
                 return_frames=True,
@@ -426,17 +483,22 @@ def forecast_tab():
     c1, c2 = st.columns(2)
     c1.success(f"✅ Forecast complete (run_id={run_id}).")
     params = out.get("params", {})
-    c2.caption(f"Params: years={params.get('years')}, macro={params.get('use_macro')}, "
-               f"infl={params.get('inflation_mode') or 'global'}, "
-               f"growth={params.get('growth_mode') or 'global'}, "
+    c2.caption(f"Seeded from: holdings • years={params.get('years')} • "
+               f"infl={params.get('inflation_mode') or 'global'} • "
+               f"growth={params.get('growth_mode') or 'global'} • "
                f"fx={params.get('fx_mode') or 'global'}.")
 
-    # Previews (note: Monthly now starts with t0 row)
-    st.markdown("#### Monthly Results (preview)")
-    _maybe_show_table("", monthly_df)
+    # ---------- NEW: Single annual results table ----------
+    st.markdown("### 📊 Annual Results (summed across portfolios)")
+    summary_df = _build_annual_summary(monthly_df, annual_df)
+    if summary_df.empty:
+        st.info("No results to display.")
+    else:
+        # nice formatting: show effective tax rate as percentage for readability
+        display = summary_df.copy()
+        if "effective_tax_rate" in display.columns:
+            display["effective_tax_rate"] = (display["effective_tax_rate"] * 100.0).round(2)
+        st.dataframe(display, use_container_width=True, hide_index=True)
 
-    st.markdown("#### Annual After-Tax Results (preview)")
-    _maybe_show_table("", annual_df)
-
-    # Export
-    _export_excel_ui(monthly_df, annual_df, run_id)
+    # Export (single sheet)
+    _export_excel_ui(summary_df, run_id)

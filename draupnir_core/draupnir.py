@@ -7,21 +7,30 @@ from typing import Optional, Dict, Any
 
 import pandas as pd
 
-# Robust imports: allow usage inside package or project root
+# Robust import whether running as a package or from project root
 try:
     from .tax_engine import calculate_annual_tax
 except Exception:
     from tax_engine import calculate_annual_tax
 
 
-DEFAULT_GROWTH = 0.05
-DEFAULT_INFL = 0.02
+# -----------------------------
+# Defaults
+# -----------------------------
+
+DEFAULT_GROWTH = 0.05      # 5% nominal asset growth
+DEFAULT_INFL = 0.02        # 2% inflation
 DEFAULT_FX = 1.0
 
 
+# -----------------------------
+# Macro helpers
+# -----------------------------
+
 def _normalize_macro_df(macro_df: pd.DataFrame | None) -> pd.DataFrame:
     """
-    Normalize into: [year, growth, inflation, fx], years starting at 0.
+    Normalize into columns: [year, growth, inflation, fx] with year index 0..N.
+    Pads to at least 120 years.
     """
     if macro_df is None or macro_df.empty:
         yrs = list(range(0, 120))
@@ -51,7 +60,7 @@ def _normalize_macro_df(macro_df: pd.DataFrame | None) -> pd.DataFrame:
     if "inflation" not in df.columns: df["inflation"] = DEFAULT_INFL
     if "fx" not in df.columns:        df["fx"] = DEFAULT_FX
 
-    df = df[["year","growth","inflation","fx"]].copy()
+    df = df[["year", "growth", "inflation", "fx"]].copy()
     df["year"] = pd.to_numeric(df["year"], errors="coerce").fillna(0).astype(int)
     df["growth"] = pd.to_numeric(df["growth"], errors="coerce").fillna(DEFAULT_GROWTH)
     df["inflation"] = pd.to_numeric(df["inflation"], errors="coerce").fillna(DEFAULT_INFL)
@@ -79,6 +88,9 @@ def get_macro_rates(macro_df: pd.DataFrame | None, settings: Dict[str, Any], inp
 
 
 def build_inflation_factors(macro_rates: pd.DataFrame, settings: Dict[str, Any], inputs_df: pd.DataFrame | None) -> pd.DataFrame:
+    """
+    Cumulative CPI by year (1.0 grows forward each year by (1+inflation)).
+    """
     out = []
     cpi = 1.0
     for _, r in macro_rates.iterrows():
@@ -87,6 +99,10 @@ def build_inflation_factors(macro_rates: pd.DataFrame, settings: Dict[str, Any],
         out.append({"year": int(r["year"]), "cpi_factor": cpi})
     return pd.DataFrame(out)
 
+
+# -----------------------------
+# Simulation (monthly) with explicit t0 row
+# -----------------------------
 
 @dataclass
 class _SimRow:
@@ -120,17 +136,11 @@ def simulate_portfolio_growth(
     years: int = 30,
     cadence: str = "monthly",
     start_date: Optional[str] = None,
-    flows_schedule: pd.DataFrame | None = None,  # optional per‑month schedule
+    flows_schedule: pd.DataFrame | None = None,  # optional override schedule per month
 ) -> pd.DataFrame:
     """
-    Simulator (monthly) with explicit t0 row:
-
-      • Row 0 (t0): beginning value for each portfolio (no growth/flows applied).
-      • Row 1 (t1): end‑of‑first‑month value after growth/flows.
-      • Then t2, t3, … similarly.
-
-    assets requires: [portfolio_id, portfolio_name, tax_treatment, starting_value]
-    inputs optional: [portfolio_id, monthly_contribution, monthly_withdrawal, index_with_inflation]
+    Emits one **t0** row per portfolio (beginning-of-period) then monthly end-of-period rows t1..tN.
+    Columns: date, portfolio_id, portfolio_name, tax_treatment, value_nominal, value_real, contributions, withdrawals
     """
     if assets is None or assets.empty:
         return pd.DataFrame(columns=[
@@ -139,21 +149,21 @@ def simulate_portfolio_growth(
         ])
 
     months = int(years) * (12 if cadence == "monthly" else 1)
-    # We'll emit months+1 rows per portfolio (including the t0 row)
+    # We want a t0 + N months → generate N+1 dates, where dates[0] is the t0 timestamp
     dates = _month_iter(start_date, months + 1)
 
     # Normalize inputs
-    if inputs is None:
+    if inputs is None or inputs.empty:
         inputs = pd.DataFrame(columns=["portfolio_id","monthly_contribution","monthly_withdrawal","index_with_inflation"])
     inputs = inputs.copy()
     for c, dv in (("monthly_contribution", 0.0), ("monthly_withdrawal", 0.0), ("index_with_inflation", 1)):
         if c not in inputs.columns:
             inputs[c] = dv
-    inputs["monthly_contribution"] = pd.to_numeric(inputs["monthly_contribution"], errors="coerce").fillna(0.0)
-    inputs["monthly_withdrawal"] = pd.to_numeric(inputs["monthly_withdrawal"], errors="coerce").fillna(0.0)
-    inputs["index_with_inflation"] = inputs["index_with_inflation"].fillna(1).astype(int)
+    inputs["monthly_contribution"]  = pd.to_numeric(inputs["monthly_contribution"], errors="coerce").fillna(0.0)
+    inputs["monthly_withdrawal"]    = pd.to_numeric(inputs["monthly_withdrawal"], errors="coerce").fillna(0.0)
+    inputs["index_with_inflation"]  = inputs["index_with_inflation"].fillna(1).astype(int)
 
-    # Assets + inputs join
+    # Join assets + inputs
     A = assets.copy()
     A["portfolio_id"] = pd.to_numeric(A["portfolio_id"], errors="coerce").astype("Int64")
     A = A.merge(
@@ -185,42 +195,42 @@ def simulate_portfolio_growth(
     rows: list[_SimRow] = []
 
     for _, p in A.iterrows():
-        pid = int(p["portfolio_id"])
+        pid   = int(p["portfolio_id"])
         pname = str(p.get("portfolio_name", f"PID {pid}"))
-        ttreat = str(p.get("tax_treatment", "TAXABLE") or "TAXABLE").upper()
-        val = float(p.get("starting_value", 0.0))
+        tt    = str(p.get("tax_treatment", "TAXABLE") or "TAXABLE").upper()
+        val   = float(p.get("starting_value", 0.0))
 
         base_contrib = float(p.get("monthly_contribution", 0.0))
         base_withdr  = float(p.get("monthly_withdrawal", 0.0))
         base_index   = int(p.get("index_with_inflation", 1))
 
-        # --- t0 row: beginning-of-period value; no flows; real = nominal (cpi = 1) ---
+        # --- t0 (beginning-of-period) -> real == nominal, zero flows ---
         rows.append(_SimRow(
             date=dates[0],
             portfolio_id=pid,
             portfolio_name=pname,
-            tax_treatment=ttreat,
+            tax_treatment=tt,
             value_nominal=round(val, 2),
             value_real=round(val, 2),
             contributions=0.0,
-            withdrawals=0.0
+            withdrawals=0.0,
         ))
 
-        # cumulative CPI for monthly real conversion (starts at 1.0 for t0)
+        # CPI accumulator for real conversions (monthly)
         cpi_cum = 1.0
 
-        # --- Months loop producing t1..tN rows at dates[1:] ---
+        # --- Months: t1..tN (end-of-period values) ---
         for m_idx in range(months):
             dt = dates[m_idx + 1]
-            y = m_idx // 12
+            y  = m_idx // 12
             g_y = float(grow_by_year.get(y, DEFAULT_GROWTH))
             i_y = float(infl_by_year.get(y, DEFAULT_INFL))
 
-            # Monthly growth & inflation
+            # Monthly factors
             r_m = (1.0 + g_y) ** (1.0 / 12.0) - 1.0
             i_m = (1.0 + i_y) ** (1.0 / 12.0) - 1.0
 
-            # Determine month’s flows
+            # Flows this month (schedule overrides inputs)
             sch = sched_map.get((pid, m_idx))
             if sch is not None:
                 s_contrib, s_withdr, s_idx_flag = sch
@@ -244,7 +254,7 @@ def simulate_portfolio_growth(
                 date=dt,
                 portfolio_id=pid,
                 portfolio_name=pname,
-                tax_treatment=ttreat,
+                tax_treatment=tt,
                 value_nominal=round(val, 2),
                 value_real=round(real_val, 2),
                 contributions=round(contrib, 2),
@@ -258,6 +268,10 @@ def simulate_portfolio_growth(
     ]]
 
 
+# -----------------------------
+# Annual after-tax aggregation
+# -----------------------------
+
 def apply_taxes(
     monthly_df: pd.DataFrame,
     employment_income: pd.DataFrame | Dict[str, float] | None,
@@ -266,8 +280,14 @@ def apply_taxes(
     macro: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Collapse monthly results to annual after-tax income by portfolio.
-    'Portfolio income' = annual withdrawals. Employment income optional.
+    Annual, per-portfolio:
+      - 'portfolio income' = sum of withdrawals in calendar year
+      - adds employment income (optional)
+      - computes nominal after-tax income, real after-tax income (deflated),
+        and taxes_paid.
+    Returns columns:
+      [year, portfolio_id, portfolio_name, tax_treatment,
+       after_tax_income, real_after_tax_income, taxes_paid]
     """
     if monthly_df is None or monthly_df.empty:
         return pd.DataFrame(columns=[
@@ -275,11 +295,11 @@ def apply_taxes(
             "after_tax_income","real_after_tax_income","taxes_paid"
         ])
 
-    # Employment income map (calendar year keyed)
+    # Employment income map by calendar year
     emp_map: Dict[int, float] = {}
     if isinstance(employment_income, dict):
         emp_map = {int(k): float(v) for k, v in employment_income.items()}
-    elif employment_income is not None and not isinstance(employment_income, dict) and not employment_income.empty:
+    elif (employment_income is not None) and isinstance(employment_income, pd.DataFrame) and not employment_income.empty:
         df = employment_income.copy()
         ycol = "year" if "year" in df.columns else df.columns[0]
         acol = "amount" if "amount" in df.columns else df.columns[1]
@@ -287,13 +307,13 @@ def apply_taxes(
         df[acol] = pd.to_numeric(df[acol], errors="coerce").fillna(0.0)
         emp_map = {int(r[ycol]): float(r[acol]) for _, r in df.iterrows() if pd.notna(r[ycol])}
 
-    # Annual CPI (for real conversion) from macro
+    # CPI accumulation (annual)
     macro_norm = _normalize_macro_df(macro)
-    cpi_factors = {int(r["year"]): float((1.0 + r["inflation"])) for _, r in macro_norm.iterrows()}
+    cpi_step = {int(r["year"]): float(1.0 + r["inflation"]) for _, r in macro_norm.iterrows()}
     cum_cpi: Dict[int, float] = {}
     acc = 1.0
     for y in range(0, 200):
-        acc *= cpi_factors.get(y, 1.0 + DEFAULT_INFL)
+        acc *= cpi_step.get(y, 1.0 + DEFAULT_INFL)
         cum_cpi[y] = acc
 
     m = monthly_df.copy()
@@ -301,6 +321,7 @@ def apply_taxes(
     y0 = int(m["year"].min())
     m["y_idx"] = m["year"] - y0
 
+    # Portfolio income = sum of withdrawals in each calendar year
     agg = (m.groupby(["y_idx","portfolio_id","portfolio_name","tax_treatment"], dropna=False)["withdrawals"]
              .sum()
              .reset_index()
@@ -308,15 +329,17 @@ def apply_taxes(
 
     records = []
     for _, r in agg.iterrows():
-        y = int(r["y_idx"]); pid = int(r["portfolio_id"])
+        y     = int(r["y_idx"])
+        pid   = int(r["portfolio_id"])
         pname = str(r["portfolio_name"])
-        ttreat = str(r["tax_treatment"] or "TAXABLE").upper()
+        tt    = str(r["tax_treatment"] or "TAXABLE").upper()
 
         port_income_nom = float(r["portfolio_income_pre"])
         emp_nom = float(emp_map.get(y0 + y, 0.0))
 
-        tax_port = calculate_annual_tax(tax_rules_conn, port_income_nom, ttreat, year=(y0 + y))
-        tax_emp  = calculate_annual_tax(tax_rules_conn, emp_nom, "EMPLOYMENT", year=(y0 + y))
+        # Taxes on portfolio income (by tax_treatment) + employment
+        tax_port = calculate_annual_tax(tax_rules_conn, port_income_nom, tt,         year=(y0 + y))
+        tax_emp  = calculate_annual_tax(tax_rules_conn, emp_nom,           "EMPLOYMENT", year=(y0 + y))
         taxes = round(tax_port + tax_emp, 2)
 
         after_tax_nom = round(port_income_nom + emp_nom - taxes, 2)
@@ -327,7 +350,7 @@ def apply_taxes(
             "year": (y0 + y),
             "portfolio_id": pid,
             "portfolio_name": pname,
-            "tax_treatment": ttreat,
+            "tax_treatment": tt,
             "after_tax_income": after_tax_nom,
             "real_after_tax_income": after_tax_real,
             "taxes_paid": taxes,

@@ -1,10 +1,14 @@
+# draupnir_core/forecast_engine.py
 """
 Forecast Engine (callable)
 
-Adds:
-- Seed from holdings (optional)
-- t0/t1 logic now lives in draupnir.simulate_portfolio_growth
-- Annual writer dedupes by (year, portfolio_id) to avoid UNIQUE violations
+Enhancement C:
+- Option to seed starting assets from CURRENT HOLDINGS (derived from trades)
+- Choice of valuation basis: "market" (live-price) or "book"
+- Maps portfolios → tax_treatment automatically via portfolios table
+
+Also retains Feature A (portfolio_flows) and the rest of the engine.
+Imports for draupnir/tax_engine are robust whether they live in the package or root.
 """
 
 from __future__ import annotations
@@ -56,9 +60,9 @@ class ForecastParams:
     fx_mode: Optional[str] = None
     notes: Optional[str] = None
 
-    # Enhancement: seed from current holdings
-    seed_from_holdings: bool = False
-    holdings_valuation: str = "market"  # "market" or "book"
+    # Enhancement C:
+    seed_from_holdings: bool = False                  # if True, ignore Assets table and derive from trades
+    holdings_valuation: str = "market"                # "market" or "book"
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -86,6 +90,9 @@ def _load_df(conn: sqlite3.Connection, sql: str, params: Tuple = ()) -> pd.DataF
         return pd.DataFrame()
 
 def _load_global_settings(conn: sqlite3.Connection) -> Dict[str, Any]:
+    """
+    Read key/value pairs from global_settings table. Never crashes; returns {} on error.
+    """
     try:
         if not _table_exists(conn, "global_settings"):
             return {}
@@ -119,12 +126,12 @@ def ensure_portfolio_flows_table(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS portfolio_flows (
             flow_id INTEGER PRIMARY KEY AUTOINCREMENT,
             portfolio_id INTEGER NOT NULL,
-            kind TEXT NOT NULL,
-            amount REAL NOT NULL,
-            frequency TEXT NOT NULL,
-            start_date TEXT NOT NULL,
-            end_date TEXT,
-            index_with_inflation INTEGER NOT NULL DEFAULT 1,
+            kind TEXT NOT NULL,                  -- 'CONTRIBUTION' or 'WITHDRAWAL'
+            amount REAL NOT NULL,                -- amount in portfolio currency
+            frequency TEXT NOT NULL,             -- 'monthly' or 'annual'
+            start_date TEXT NOT NULL,            -- 'YYYY-MM-01'
+            end_date TEXT,                       -- nullable; if NULL, open-ended
+            index_with_inflation INTEGER NOT NULL DEFAULT 1, -- 1/0
             notes TEXT,
             created_at TEXT DEFAULT (datetime('now'))
         );
@@ -141,7 +148,7 @@ def load_portfolio_flows(conn: sqlite3.Connection) -> pd.DataFrame:
     """)
 
 # -----------------------------
-# Seed from holdings
+# Enhancement C: build assets from holdings
 # -----------------------------
 
 def _load_trades(conn: sqlite3.Connection) -> pd.DataFrame:
@@ -211,6 +218,11 @@ def _fetch_prices(symbols: Iterable[str]) -> Dict[str, Optional[float]]:
     return out
 
 def _holdings_to_assets(conn: sqlite3.Connection, valuation: str = "market") -> pd.DataFrame:
+    """
+    Build starting assets per portfolio from current holdings. If valuation='market',
+    we use live prices where available and **fall back to book_value** where prices
+    are missing to avoid zero starts.
+    """
     trades = _load_trades(conn)
     if trades.empty:
         return pd.DataFrame()
@@ -226,8 +238,10 @@ def _holdings_to_assets(conn: sqlite3.Connection, valuation: str = "market") -> 
             lambda r: (r["current_qty"] * r["live_price"]) if pd.notna(r.get("live_price")) else None,
             axis=1
         )
-        per_pf = pos.groupby(["portfolio_id","portfolio_name"], dropna=False)["mkt_value"].sum(min_count=1).reset_index()
-        per_pf = per_pf.rename(columns={"mkt_value":"starting_value"})
+        # Fallback to book_value where market price is missing
+        pos["mkt_or_book"] = pos["mkt_value"].where(pos["mkt_value"].notna(), pos["book_value"])
+        per_pf = pos.groupby(["portfolio_id","portfolio_name"], dropna=False)["mkt_or_book"].sum(min_count=1).reset_index()
+        per_pf = per_pf.rename(columns={"mkt_or_book":"starting_value"})
     else:
         per_pf = pos.groupby(["portfolio_id","portfolio_name"], dropna=False)["book_value"].sum(min_count=1).reset_index()
         per_pf = per_pf.rename(columns={"book_value":"starting_value"})
@@ -241,7 +255,7 @@ def _holdings_to_assets(conn: sqlite3.Connection, valuation: str = "market") -> 
     return per_pf
 
 # -----------------------------
-# Flows → monthly inputs
+# Flows → monthly inputs (Feature A)
 # -----------------------------
 
 def _flows_to_monthly_inputs(flows: pd.DataFrame) -> pd.DataFrame:
@@ -295,21 +309,26 @@ def run_forecast(
 
     conn = _connect(db_path)
     try:
+        # Use DB-driven global settings (avoid utils signature mismatches)
         settings = _load_global_settings(conn)
 
-        # per-run overrides
+        # Apply per-run overrides if supplied
         for k in ("inflation_mode", "growth_mode", "fx_mode"):
             v = getattr(fp, k)
             if v:
                 settings[k] = str(v).lower()
 
-        # Seed assets
-        assets_df = _holdings_to_assets(conn, valuation=fp.holdings_valuation) if fp.seed_from_holdings else load_assets(conn)
+        # Seed assets (holdings or legacy Assets table)
+        if fp.seed_from_holdings:
+            assets_df = _holdings_to_assets(conn, valuation=fp.holdings_valuation)
+        else:
+            assets_df = load_assets(conn)
+
         inputs_df   = load_projection_inputs(conn)
         macro_df    = load_macro_forecast(conn) if fp.use_macro else pd.DataFrame()
         income_df   = load_employment_income(conn)
 
-        # Portfolio flows → monthly inputs (merge into inputs_df)
+        # Portfolio flows → monthly inputs
         flows_df = load_portfolio_flows(conn)
         flows_inputs = _flows_to_monthly_inputs(flows_df)
         if not flows_inputs.empty:
@@ -420,9 +439,8 @@ def _write_results(
     monthly_df: pd.DataFrame,
     annual_df: pd.DataFrame,
 ) -> None:
-    # Normalize column names
-    m = (monthly_df or pd.DataFrame()).copy()
-    a = (annual_df or pd.DataFrame()).copy()
+    m = monthly_df.copy()
+    a = annual_df.copy()
 
     m = m.rename(columns={
         "date": "period",
@@ -445,23 +463,6 @@ def _write_results(
         if col not in a.columns:
             a[col] = None
 
-    # ---- Key fix: aggregate/dedupe annual rows BEFORE writing ----
-    if not a.empty:
-        # enforce numeric + text types
-        a["year"] = pd.to_numeric(a["year"], errors="coerce").astype("Int64")
-        a["portfolio_id"] = pd.to_numeric(a["portfolio_id"], errors="coerce").astype("Int64")
-        for c in ["after_tax_income","real_after_tax_income","taxes_paid"]:
-            a[c] = pd.to_numeric(a[c], errors="coerce").fillna(0.0)
-
-        a = (a.groupby(["year","portfolio_id"], dropna=False, as_index=False)
-               .agg({
-                   "portfolio_name":"first",
-                   "tax_treatment":"first",
-                   "after_tax_income":"sum",
-                   "real_after_tax_income":"sum",
-                   "taxes_paid":"sum"
-               }))
-
     m["run_id"] = run_id
     a["run_id"] = run_id
 
@@ -474,11 +475,6 @@ def _write_results(
         "after_tax_income","real_after_tax_income","taxes_paid"
     ]
 
-    # Clean out any orphan rows for this run_id (defensive) then insert
-    with conn:
-        conn.execute("DELETE FROM forecast_results_monthly WHERE run_id = ?", (run_id,))
-        conn.execute("DELETE FROM forecast_results_annual  WHERE run_id = ?", (run_id,))
-        if not m.empty:
-            m[m_cols].to_sql("forecast_results_monthly", conn, if_exists="append", index=False)
-        if not a.empty:
-            a[a_cols].to_sql("forecast_results_annual",  conn, if_exists="append", index=False)
+    m[m_cols].to_sql("forecast_results_monthly", conn, if_exists="append", index=False)
+    a[a_cols].to_sql("forecast_results_annual",  conn, if_exists="append", index=False)
+    conn.commit()
