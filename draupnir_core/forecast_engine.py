@@ -5,13 +5,13 @@ Forecast Engine (callable)
 - Seeds starting assets from CURRENT HOLDINGS (derived from trades) or Assets
 - Choice of valuation basis: "market" (live-price) or "book"
 - Maps portfolios → tax_treatment automatically via portfolios table
-- Uses portfolio_flows ONLY (ProjectionInputs removed)
+- Uses portfolio_flows as the single source of truth for contributions/withdrawals.
 
-NEW:
-- Support manual (constant) macro assumptions when Use Macro Forecast is OFF.
-- Persist expanded annual table with nominal/real income & tax columns only (legacy columns removed).
-- Write contributions/withdrawals in REAL terms at the annual level.
-- Auto-migrate forecast_results_annual to the new schema if needed.
+NEW (this patch):
+- Flows now respect start_date / end_date / frequency by expanding to a per-month schedule.
+- The schedule is passed to simulate_portfolio_growth(..., flows_schedule=...), which handles
+  inflation indexing and application timing.
+- Annual table persists nominal/real income & tax columns (unchanged).
 """
 
 from __future__ import annotations
@@ -261,10 +261,114 @@ def _holdings_to_assets(conn: sqlite3.Connection, valuation: str = "market") -> 
     return per_pf
 
 # -----------------------------
-# Flows → monthly inputs (ProjectionInputs removed)
+# Flows → schedule (RESPECTS DATES)
+# -----------------------------
+
+def _parse_ym(s: Optional[str]) -> Optional[pd.Timestamp]:
+    if not s:
+        return None
+    try:
+        # Expect 'YYYY-MM-01' but accept 'YYYY-MM' too
+        ts = pd.to_datetime(str(s), errors="coerce")
+        if pd.isna(ts):
+            return None
+        return ts.normalize().replace(day=1)
+    except Exception:
+        return None
+
+def _months_between(d0: pd.Timestamp, d1: pd.Timestamp) -> int:
+    """How many whole months to move from d0 to reach d1 (can be negative)."""
+    return (d1.year - d0.year) * 12 + (d1.month - d0.month)
+
+def _build_flows_schedule(
+    flows: pd.DataFrame,
+    sim_start: pd.Timestamp,
+    years: int
+) -> pd.DataFrame:
+    """
+    Expand portfolio_flows into a month-indexed schedule compatible with simulate_portfolio_growth:
+      columns => [portfolio_id, m_idx, contrib, withdraw, index_flag]
+    - frequency='monthly' → apply each month from start_date..end_date (or to horizon)
+    - frequency='annual'  → apply once per year in the start month (same month of year)
+    - start_date/end_date are respected; anything before sim_start is skipped.
+    - amounts are PRE-inflation; simulate_portfolio_growth applies indexing per month.
+    """
+    if flows is None or flows.empty:
+        return pd.DataFrame(columns=["portfolio_id","m_idx","contrib","withdraw","index_flag"])
+
+    horizon = max(1, int(years)) * 12
+    rows: List[Dict[str, Any]] = []
+
+    for r in flows.itertuples(index=False):
+        pid   = int(getattr(r, "portfolio_id"))
+        kind  = str(getattr(r, "kind", "")).strip().upper()
+        freq  = str(getattr(r, "frequency", "")).strip().lower()
+        amt   = float(getattr(r, "amount", 0.0) or 0.0)
+        idx   = int(getattr(r, "index_with_inflation", 1) or 0)
+        sd    = _parse_ym(getattr(r, "start_date", None))
+        ed    = _parse_ym(getattr(r, "end_date", None))
+
+        if amt <= 0 or sd is None:
+            continue
+
+        start_m = max(0, _months_between(sim_start, sd))
+        end_m = (horizon - 1) if ed is None else min(horizon - 1, _months_between(sim_start, ed))
+        if end_m < 0 or start_m > (horizon - 1):
+            continue  # entirely out of horizon
+
+        if freq == "monthly":
+            step = 1
+            base_contrib = amt if kind == "CONTRIBUTION" else 0.0
+            base_withdr  = amt if kind == "WITHDRAWAL"  else 0.0
+            for m in range(start_m, end_m + 1, step):
+                rows.append({
+                    "portfolio_id": pid,
+                    "m_idx": m,
+                    "contrib": base_contrib,
+                    "withdraw": base_withdr,
+                    "index_flag": idx,
+                })
+        elif freq == "annual":
+            # Apply once per year on the start month (every 12 months)
+            base_contrib = amt if kind == "CONTRIBUTION" else 0.0
+            base_withdr  = amt if kind == "WITHDRAWAL"  else 0.0
+            m = start_m
+            while m <= end_m:
+                rows.append({
+                    "portfolio_id": pid,
+                    "m_idx": m,
+                    "contrib": base_contrib,
+                    "withdraw": base_withdr,
+                    "index_flag": idx,
+                })
+                m += 12
+        else:
+            # Unknown frequency -> treat like monthly for safety
+            base_contrib = amt if kind == "CONTRIBUTION" else 0.0
+            base_withdr  = amt if kind == "WITHDRAWAL"  else 0.0
+            for m in range(start_m, end_m + 1):
+                rows.append({
+                    "portfolio_id": pid,
+                    "m_idx": m,
+                    "contrib": base_contrib,
+                    "withdraw": base_withdr,
+                    "index_flag": idx,
+                })
+
+    if not rows:
+        return pd.DataFrame(columns=["portfolio_id","m_idx","contrib","withdraw","index_flag"])
+    return pd.DataFrame(rows)
+
+# -----------------------------
+# Legacy flows → monthly inputs (KEPT for base rates; dates ignored)
 # -----------------------------
 
 def _flows_to_monthly_inputs(flows: pd.DataFrame) -> pd.DataFrame:
+    """
+    Still used to provide per-portfolio base amounts, but timing is now controlled by
+    the explicit flows_schedule built above. When schedule is provided, these base
+    amounts are only used if no matching (pid, month) entries exist.
+    """
     if flows is None or flows.empty:
         return pd.DataFrame(columns=[
             "portfolio_id", "monthly_contribution", "monthly_withdrawal", "index_with_inflation"
@@ -313,6 +417,15 @@ def _constant_macro_df(years: int, growth: float, inflation: float, fx: float) -
         "fx": [float(fx)] * len(yrs),
     })
 
+def _resolve_sim_start(start_date: Optional[str]) -> pd.Timestamp:
+    if start_date:
+        try:
+            return pd.to_datetime(start_date).normalize().replace(day=1)
+        except Exception:
+            pass
+    # Default: first day of the current month
+    return pd.Timestamp.today().normalize().replace(day=1)
+
 def run_forecast(
     db_path: str = DB_PATH_DEFAULT,
     params: ForecastParams | Dict[str, Any] = ForecastParams(),
@@ -323,7 +436,6 @@ def run_forecast(
 
     conn = _connect(db_path)
     try:
-        # Global settings (kept, but no longer drive macro modes)
         settings = _load_global_settings(conn)
 
         # Seed assets
@@ -343,8 +455,14 @@ def run_forecast(
 
         income_df = load_employment_income(conn)
 
-        # Portfolio flows (single source of truth)
+        # Portfolio flows (source of truth)
         flows_df = load_portfolio_flows(conn)
+
+        # Build schedule that respects start/end/frequency
+        sim_start = _resolve_sim_start(fp.start_date)
+        schedule_df = _build_flows_schedule(flows_df, sim_start, fp.years)
+
+        # Base per-portfolio amounts (kept for completeness)
         inputs_df = _flows_to_monthly_inputs(flows_df)
         if inputs_df.empty:
             inputs_df = pd.DataFrame(columns=["portfolio_id","monthly_contribution","monthly_withdrawal","index_with_inflation"])
@@ -360,7 +478,8 @@ def run_forecast(
             settings=settings,
             years=fp.years,
             cadence=fp.cadence,
-            start_date=fp.start_date,
+            start_date=str(sim_start.date()),
+            flows_schedule=schedule_df,  # <-- enforce timing
         )
 
         annual_df = apply_taxes(
@@ -391,7 +510,7 @@ def run_forecast(
         conn.close()
 
 # -----------------------------
-# Results persistence
+# Results persistence (unchanged other than imports)
 # -----------------------------
 
 def _ensure_forecast_run_tables(conn: sqlite3.Connection) -> None:
@@ -420,23 +539,14 @@ def _ensure_forecast_run_tables(conn: sqlite3.Connection) -> None:
     )
     conn.commit()
 
-# New canonical annual schema (no legacy columns)
 _ANNUAL_COLUMNS = [
-    ("run_id",                        "INTEGER"),
-    ("year",                          "INTEGER"),
-    ("portfolio_id",                  "INTEGER"),
-    ("portfolio_name",                "TEXT"),
-    ("tax_treatment",                 "TEXT"),
-    ("nominal_pretax_income",         "REAL"),
-    ("nominal_taxes_paid",            "REAL"),
-    ("nominal_after_tax_income",      "REAL"),
-    ("nominal_effective_tax_rate",    "REAL"),
-    ("real_pretax_income",            "REAL"),
-    ("real_taxes_paid",               "REAL"),
-    ("real_after_tax_income",         "REAL"),
-    ("real_effective_tax_rate",       "REAL"),
-    ("contributions",                 "REAL"),
-    ("withdrawals",                   "REAL")
+    ("run_id","INTEGER"),("year","INTEGER"),("portfolio_id","INTEGER"),
+    ("portfolio_name","TEXT"),("tax_treatment","TEXT"),
+    ("nominal_pretax_income","REAL"),("nominal_taxes_paid","REAL"),
+    ("nominal_after_tax_income","REAL"),("nominal_effective_tax_rate","REAL"),
+    ("real_pretax_income","REAL"),("real_taxes_paid","REAL"),
+    ("real_after_tax_income","REAL"),("real_effective_tax_rate","REAL"),
+    ("contributions","REAL"),("withdrawals","REAL")
 ]
 
 def _create_annual_table(conn: sqlite3.Connection, table_name: str = "forecast_results_annual") -> None:
@@ -451,43 +561,23 @@ def _create_annual_table(conn: sqlite3.Connection, table_name: str = "forecast_r
     conn.commit()
 
 def _ensure_annual_schema(conn: sqlite3.Connection) -> None:
-    """
-    Ensure forecast_results_annual has ONLY the new columns.
-    If legacy columns exist or columns are missing, migrate by rebuild.
-    """
     if not _table_exists(conn, "forecast_results_annual"):
         _create_annual_table(conn, "forecast_results_annual")
         return
 
     have = _get_table_columns(conn, "forecast_results_annual")
     want = [c[0] for c in _ANNUAL_COLUMNS]
-
-    # Detect any mismatch (extra legacy columns or missing new ones)
     if set(have) == set(want):
-        return  # already correct
+        return
 
-    # Build a new table, copy data (mapping from either new or legacy columns), swap it in.
     conn.execute("BEGIN;")
     try:
         _create_annual_table(conn, "forecast_results_annual_new")
-
-        # Compose SELECT list with graceful fallbacks from legacy columns
-        # Legacy names that may exist:
-        #   after_tax_income, real_after_tax_income, taxes_paid, pretax_income, effective_tax_rate
         select_exprs = [
-            "run_id",
-            "year",
-            "portfolio_id",
-            "portfolio_name",
-            "tax_treatment",
-
-            # nominal_pretax_income
+            "run_id","year","portfolio_id","portfolio_name","tax_treatment",
             "COALESCE(nominal_pretax_income, (COALESCE(after_tax_income,0)+COALESCE(taxes_paid,0))) AS nominal_pretax_income",
-            # nominal_taxes_paid
             "COALESCE(nominal_taxes_paid, taxes_paid, 0.0) AS nominal_taxes_paid",
-            # nominal_after_tax_income
             "COALESCE(nominal_after_tax_income, after_tax_income, 0.0) AS nominal_after_tax_income",
-            # nominal_effective_tax_rate
             """COALESCE(
                    nominal_effective_tax_rate,
                    CASE WHEN (COALESCE(after_tax_income,0)+COALESCE(taxes_paid,0)) > 0
@@ -495,18 +585,13 @@ def _ensure_annual_schema(conn: sqlite3.Connection) -> None:
                         ELSE 0.0 END,
                    0.0
                ) AS nominal_effective_tax_rate""",
-
-            # real_pretax_income
             """COALESCE(
                    real_pretax_income,
                    COALESCE(real_after_tax_income,0) + COALESCE(real_taxes_paid, 0.0),
                    0.0
                ) AS real_pretax_income""",
-            # real_taxes_paid
             "COALESCE(real_taxes_paid, 0.0) AS real_taxes_paid",
-            # real_after_tax_income
             "COALESCE(real_after_tax_income, 0.0) AS real_after_tax_income",
-            # real_effective_tax_rate
             """COALESCE(
                    real_effective_tax_rate,
                    CASE WHEN (COALESCE(real_after_tax_income,0) + COALESCE(real_taxes_paid,0)) > 0
@@ -514,13 +599,9 @@ def _ensure_annual_schema(conn: sqlite3.Connection) -> None:
                         ELSE 0.0 END,
                    0.0
                ) AS real_effective_tax_rate""",
-
-            # contributions / withdrawals (real terms); default 0 if missing
             "COALESCE(contributions, 0.0) AS contributions",
             "COALESCE(withdrawals, 0.0) AS withdrawals",
         ]
-
-        # Only copy if old table actually has rows
         conn.execute(f"""
             INSERT INTO forecast_results_annual_new (
                 {", ".join([c[0] for c in _ANNUAL_COLUMNS])}
@@ -529,12 +610,9 @@ def _ensure_annual_schema(conn: sqlite3.Connection) -> None:
                 {", ".join(select_exprs)}
             FROM forecast_results_annual;
         """)
-
-        # Swap tables
         conn.execute("ALTER TABLE forecast_results_annual RENAME TO forecast_results_annual_legacy_backup;")
         conn.execute("ALTER TABLE forecast_results_annual_new RENAME TO forecast_results_annual;")
         conn.execute("DROP TABLE IF EXISTS forecast_results_annual_legacy_backup;")
-
         conn.commit()
     except Exception:
         conn.execute("ROLLBACK;")
@@ -572,7 +650,7 @@ def _write_results(
     ]
     m[m_cols].to_sql("forecast_results_monthly", conn, if_exists="append", index=False)
 
-    # ---------- Annual (new canonical schema) ----------
+    # ---------- Annual (canonical schema) ----------
     a = annual_df.copy() if annual_df is not None else pd.DataFrame()
     if a.empty:
         a = pd.DataFrame(columns=["year","portfolio_id","portfolio","tax_treatment","after_tax","after_tax_real","taxes"])
@@ -588,7 +666,6 @@ def _write_results(
         if col not in a.columns:
             a[col] = None
 
-    # Contributions/withdrawals in REAL terms: derive from monthly via deflator
     mm = monthly_df.copy()
     mm["year"] = pd.to_datetime(mm["date"]).dt.year
     defl = (pd.to_numeric(mm["value_nominal"], errors="coerce") /
@@ -634,12 +711,9 @@ def _write_results(
     a_enriched[["contributions","withdrawals"]] = a_enriched[["contributions","withdrawals"]].fillna(0.0)
     a_enriched["run_id"] = run_id
 
-    # Ensure canonical schema exists
     _ensure_annual_schema(conn)
-
-    # Final column order (only new schema)
     out_cols = [c[0] for c in _ANNUAL_COLUMNS]
-    # Upsert for run: replace any existing rows for run_id (simple delete-then-insert)
+
     conn.execute("DELETE FROM forecast_results_annual WHERE run_id = ?;", (run_id,))
     conn.commit()
 
