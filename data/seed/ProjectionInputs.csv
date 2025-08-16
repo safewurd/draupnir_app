@@ -1,3 +1,0 @@
-input_id,portfolio_id,annual_growth,monthly_contrib,monthly_withdrawal,years,scenario_name,created_at,account_number,annual_inflation,base_currency
-1,1,0.07,25000,10000,40,baseline,2025-07-29 15:32:43,654321,0.03,CAD
-2,2,0.07,25000,10000,40,baseline,2025-07-29 15:32:43,654322,0.03,CAD

@@ -1,2 +1,0 @@
-trade_id,portfolio_id,ticker,quantity,currency,book_price,market_price,book_value,market_value,book_value_cad,market_value_cad,account_number,book_value_usd,market_value_usd
-1,1,RY,35000,CAD,150,177.47999572753906,5250000,6211799.850463867,5250000,6211799.850463867,654321,3832116.7883211677,4534160.474791144

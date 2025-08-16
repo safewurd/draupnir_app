@@ -1,9 +1,0 @@
-key,value
-default_portfolio_id,1
-base_currency,CAD
-fx_mode,static
-inflation_mode,static
-growth_mode,static
-macro_mode,static
-market_data_provider,yahoo
-forecast_output_dir,C:\Users\ryann\Dropbox\Ryan\Finance\draupnir_app\exports

@@ -7,10 +7,12 @@ Forecast Engine (callable)
 - Maps portfolios → tax_treatment automatically via portfolios table
 - Uses portfolio_flows as the single source of truth for contributions/withdrawals.
 
-NEW (this patch):
+Fixes and improvements:
 - Flows now respect start_date / end_date / frequency by expanding to a per-month schedule.
-- The schedule is passed to simulate_portfolio_growth(..., flows_schedule=...), which handles
-  inflation indexing and application timing.
+- Supported frequencies: monthly, annual, quarterly, semiannual, once (fires on the start month only).
+- When a flows_schedule exists for a portfolio, the legacy "base" monthly inputs are zeroed for that portfolio
+  to prevent premature contributions/withdrawals starting at the sim start (this fixes the 2030 start bug).
+- Inflation indexing is handled by downstream simulate_portfolio_growth using the schedule's timing.
 - Annual table persists nominal/real income & tax columns (unchanged).
 """
 
@@ -140,7 +142,7 @@ def ensure_portfolio_flows_table(conn: sqlite3.Connection) -> None:
             portfolio_id INTEGER NOT NULL,
             kind TEXT NOT NULL,                  -- 'CONTRIBUTION' or 'WITHDRAWAL'
             amount REAL NOT NULL,
-            frequency TEXT NOT NULL,             -- 'monthly' or 'annual'
+            frequency TEXT NOT NULL,             -- 'monthly' | 'annual' | 'quarterly' | 'semiannual' | 'once'
             start_date TEXT NOT NULL,            -- 'YYYY-MM-01'
             end_date TEXT,                       -- nullable
             index_with_inflation INTEGER NOT NULL DEFAULT 1, -- 1/0
@@ -206,7 +208,8 @@ def _aggregate_holdings(trades: pd.DataFrame) -> pd.DataFrame:
         lambda r: (r["total_buy_cost"]/r["total_buy_qty"]) if r["total_buy_qty"]>0 else None, axis=1
     )
     pos["book_value"] = pos.apply(
-        lambda r: (r["current_qty"]*r["avg_book_price"]) if r["avg_book_price"] is not None else None, axis=1
+        lambda r: (r["current_qty"]*r["avg_book_price"]) if r["avg_book_price"] is not None else None,
+        axis=1
     )
     pos = pos[pd.to_numeric(pos["current_qty"], errors="coerce").fillna(0).ne(0)]
     return pos.reset_index(drop=True)
@@ -288,8 +291,11 @@ def _build_flows_schedule(
     """
     Expand portfolio_flows into a month-indexed schedule compatible with simulate_portfolio_growth:
       columns => [portfolio_id, m_idx, contrib, withdraw, index_flag]
-    - frequency='monthly' → apply each month from start_date..end_date (or to horizon)
-    - frequency='annual'  → apply once per year in the start month (same month of year)
+    - frequency='monthly'     → apply each month from start_date..end_date (or to horizon)
+    - frequency='annual'      → apply once per year in the start month (same month of year)
+    - frequency='quarterly'   → apply every 3 months starting at start_date month
+    - frequency='semiannual'  → apply every 6 months starting at start_date month
+    - frequency='once'        → apply only in the start_date month
     - start_date/end_date are respected; anything before sim_start is skipped.
     - amounts are PRE-inflation; simulate_portfolio_growth applies indexing per month.
     """
@@ -316,48 +322,43 @@ def _build_flows_schedule(
         if end_m < 0 or start_m > (horizon - 1):
             continue  # entirely out of horizon
 
-        if freq == "monthly":
+        base_contrib = amt if kind == "CONTRIBUTION" else 0.0
+        base_withdr  = amt if kind == "WITHDRAWAL"  else 0.0
+
+        if freq in ("", "monthly"):
             step = 1
-            base_contrib = amt if kind == "CONTRIBUTION" else 0.0
-            base_withdr  = amt if kind == "WITHDRAWAL"  else 0.0
             for m in range(start_m, end_m + 1, step):
-                rows.append({
-                    "portfolio_id": pid,
-                    "m_idx": m,
-                    "contrib": base_contrib,
-                    "withdraw": base_withdr,
-                    "index_flag": idx,
-                })
+                rows.append({"portfolio_id": pid, "m_idx": m, "contrib": base_contrib, "withdraw": base_withdr, "index_flag": idx})
         elif freq == "annual":
-            # Apply once per year on the start month (every 12 months)
-            base_contrib = amt if kind == "CONTRIBUTION" else 0.0
-            base_withdr  = amt if kind == "WITHDRAWAL"  else 0.0
             m = start_m
             while m <= end_m:
-                rows.append({
-                    "portfolio_id": pid,
-                    "m_idx": m,
-                    "contrib": base_contrib,
-                    "withdraw": base_withdr,
-                    "index_flag": idx,
-                })
+                rows.append({"portfolio_id": pid, "m_idx": m, "contrib": base_contrib, "withdraw": base_withdr, "index_flag": idx})
                 m += 12
+        elif freq == "quarterly":
+            m = start_m
+            while m <= end_m:
+                rows.append({"portfolio_id": pid, "m_idx": m, "contrib": base_contrib, "withdraw": base_withdr, "index_flag": idx})
+                m += 3
+        elif freq == "semiannual":
+            m = start_m
+            while m <= end_m:
+                rows.append({"portfolio_id": pid, "m_idx": m, "contrib": base_contrib, "withdraw": base_withdr, "index_flag": idx})
+                m += 6
+        elif freq == "once":
+            if start_m <= end_m:
+                rows.append({"portfolio_id": pid, "m_idx": start_m, "contrib": base_contrib, "withdraw": base_withdr, "index_flag": idx})
         else:
             # Unknown frequency -> treat like monthly for safety
-            base_contrib = amt if kind == "CONTRIBUTION" else 0.0
-            base_withdr  = amt if kind == "WITHDRAWAL"  else 0.0
             for m in range(start_m, end_m + 1):
-                rows.append({
-                    "portfolio_id": pid,
-                    "m_idx": m,
-                    "contrib": base_contrib,
-                    "withdraw": base_withdr,
-                    "index_flag": idx,
-                })
+                rows.append({"portfolio_id": pid, "m_idx": m, "contrib": base_contrib, "withdraw": base_withdr, "index_flag": idx})
 
     if not rows:
         return pd.DataFrame(columns=["portfolio_id","m_idx","contrib","withdraw","index_flag"])
-    return pd.DataFrame(rows)
+    sched = pd.DataFrame(rows)
+    # Ensure integer types where appropriate
+    sched["m_idx"] = sched["m_idx"].astype(int)
+    sched["portfolio_id"] = sched["portfolio_id"].astype(int)
+    return sched
 
 # -----------------------------
 # Legacy flows → monthly inputs (KEPT for base rates; dates ignored)
@@ -365,9 +366,9 @@ def _build_flows_schedule(
 
 def _flows_to_monthly_inputs(flows: pd.DataFrame) -> pd.DataFrame:
     """
-    Still used to provide per-portfolio base amounts, but timing is now controlled by
-    the explicit flows_schedule built above. When schedule is provided, these base
-    amounts are only used if no matching (pid, month) entries exist.
+    Still used to provide per-portfolio base amounts; timing is controlled by explicit flows_schedule.
+    If a schedule exists for a portfolio, we'll zero these base amounts before calling the simulator,
+    so legacy inputs won't trigger early flows.
     """
     if flows is None or flows.empty:
         return pd.DataFrame(columns=[
@@ -376,12 +377,26 @@ def _flows_to_monthly_inputs(flows: pd.DataFrame) -> pd.DataFrame:
 
     f = flows.copy()
     f["frequency"] = f["frequency"].str.lower().str.strip()
-    f = f[f["frequency"].isin(["monthly", "annual"])]
+    f = f[f["frequency"].isin(["monthly", "annual", "quarterly", "semiannual", "once"])]
 
-    f["m_eq"] = f.apply(
-        lambda r: float(r["amount"]) if r["frequency"] == "monthly" else float(r["amount"]) / 12.0,
-        axis=1
-    )
+    # Map each frequency to a monthly equivalent *only* for legacy inputs
+    def _to_monthly_equiv(row) -> float:
+        amt = float(row["amount"])
+        frq = str(row["frequency"])
+        if frq == "monthly":
+            return amt
+        if frq == "annual":
+            return amt / 12.0
+        if frq == "quarterly":
+            return amt / 3.0
+        if frq == "semiannual":
+            return amt / 6.0
+        if frq == "once":
+            # One-time flows have no steady monthly equivalent; treat as 0 for base inputs
+            return 0.0
+        return amt
+
+    f["m_eq"] = f.apply(_to_monthly_equiv, axis=1)
 
     contrib = (
         f[f["kind"].str.upper() == "CONTRIBUTION"]
@@ -466,6 +481,18 @@ def run_forecast(
         inputs_df = _flows_to_monthly_inputs(flows_df)
         if inputs_df.empty:
             inputs_df = pd.DataFrame(columns=["portfolio_id","monthly_contribution","monthly_withdrawal","index_with_inflation"])
+
+        # --- CRITICAL FIX: if a schedule exists for a portfolio, zero legacy base amounts
+        # This prevents contributions/withdrawals from starting at sim start when the schedule
+        # says they should begin later (e.g., 2030-01-01).
+        if schedule_df is not None and not schedule_df.empty and not inputs_df.empty:
+            scheduled_pids = set(schedule_df["portfolio_id"].unique().tolist())
+            mask = inputs_df["portfolio_id"].isin(scheduled_pids)
+            if "monthly_contribution" in inputs_df.columns:
+                inputs_df.loc[mask, "monthly_contribution"] = 0.0
+            if "monthly_withdrawal" in inputs_df.columns:
+                inputs_df.loc[mask, "monthly_withdrawal"] = 0.0
+            # Note: we keep index_with_inflation flag; simulate_portfolio_growth should rely on the schedule's index_flag.
 
         macro_rates  = get_macro_rates(macro_df, settings, inputs_df)
         infl_factors = build_inflation_factors(macro_rates, settings, inputs_df)
