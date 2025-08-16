@@ -47,20 +47,20 @@ def _get_setting(key: str) -> str | None:
         conn.close()
 
 # -----------------------------
-# Introspection helpers
+# Introspection helpers (monthly)
 # -----------------------------
 
 def _get_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     try:
         rows = conn.execute(f"PRAGMA table_info({table});").fetchall()
-        return {r[1] for r in rows}  # r[1] = name
+        return {r[1] for r in rows}
     except Exception:
         return set()
 
 def _monthly_real_value_column(conn: sqlite3.Connection) -> str | None:
     """
-    Return the correct column name to read the end-of-month real value from
-    forecast_results_monthly. New writer uses 'real_value'. Legacy rows might have 'value_real'.
+    Return the real value column name in forecast_results_monthly.
+    New writer uses 'real_value'; legacy rows might have 'value_real'.
     """
     cols = _get_columns(conn, "forecast_results_monthly")
     if "real_value" in cols:
@@ -70,7 +70,7 @@ def _monthly_real_value_column(conn: sqlite3.Connection) -> str | None:
     return None
 
 # -----------------------------
-# Annual results loader (from DB)
+# Annual results loader (from DB) — NEW-ONLY columns
 # -----------------------------
 
 def _load_annual_results_for_run(run_id: int) -> pd.DataFrame:
@@ -79,8 +79,7 @@ def _load_annual_results_for_run(run_id: int) -> pd.DataFrame:
         if not _table_exists(conn, "forecast_results_annual"):
             return pd.DataFrame()
 
-        # Pull the expanded annual rows (per-portfolio; we'll aggregate later)
-        # We rely on the NEW columns only; older legacy columns are present but not used here.
+        # Pull NEW columns only
         a = pd.read_sql("""
             SELECT
                 year,
@@ -95,18 +94,16 @@ def _load_annual_results_for_run(run_id: int) -> pd.DataFrame:
             WHERE run_id = ?
         """, conn, params=(run_id,))
 
-        # Bring in year-end value_real (per portfolio) from monthly table
+        # Bring in year-end real value (per portfolio) from monthly table
         if not _table_exists(conn, "forecast_results_monthly"):
             a["value_real"] = 0.0
             return a
 
         real_col = _monthly_real_value_column(conn)
         if not real_col:
-            # Neither 'real_value' nor legacy 'value_real' exist → treat as zero to avoid crash
             a["value_real"] = 0.0
             return a
 
-        # Build a query that uses the single, actually-existing column name and alias it to value_real
         m_sql = f"""
             SELECT year, portfolio_id, value_real
             FROM (
@@ -503,13 +500,12 @@ def forecast_tab():
     else:
         c2.caption(f"Assumptions: manual constants • growth={mg:.4f}, infl={mi:.4f}, fx={mx:.4f} • years={int(years)}.")
 
-    # ---------- Annual results table (summed across portfolios) ----------
+    # ---------- Annual results table (summed across portfolios; NEW columns only) ----------
     st.markdown("### 📊 Annual Results (summed across portfolios)")
     raw = _load_annual_results_for_run(run_id)
     if raw.empty:
         st.info("No results to display.")
     else:
-        # Aggregate across portfolios and recompute effective tax rate on the totals
         g = (raw.groupby("year", as_index=False)[
             ["value_real","contributions","withdrawals","real_pretax_income","real_taxes_paid","real_after_tax_income"]
         ].sum(numeric_only=True))

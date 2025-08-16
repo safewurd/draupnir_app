@@ -9,8 +9,9 @@ Forecast Engine (callable)
 
 NEW:
 - Support manual (constant) macro assumptions when Use Macro Forecast is OFF.
-- Persist expanded annual table with nominal/real income & tax columns.
+- Persist expanded annual table with nominal/real income & tax columns only (legacy columns removed).
 - Write contributions/withdrawals in REAL terms at the annual level.
+- Auto-migrate forecast_results_annual to the new schema if needed.
 """
 
 from __future__ import annotations
@@ -37,7 +38,7 @@ try:
         DEFAULT_INFL,
         DEFAULT_FX,
     )
-    from . import tax_engine as tax_engine  # noqa: F401  (kept for compatibility)
+    from . import tax_engine as tax_engine  # noqa: F401
 except Exception:
     from draupnir import (
         get_macro_rates,
@@ -95,6 +96,13 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     ).fetchone()
     return row is not None
 
+def _get_table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
+    try:
+        cur = conn.execute(f"PRAGMA table_info({table});")
+        return [r[1] for r in cur.fetchall()]
+    except Exception:
+        return []
+
 def _load_df(conn: sqlite3.Connection, sql: str, params: Tuple = ()) -> pd.DataFrame:
     try:
         return pd.read_sql(sql, conn, params=params)
@@ -131,7 +139,7 @@ def ensure_portfolio_flows_table(conn: sqlite3.Connection) -> None:
             flow_id INTEGER PRIMARY KEY AUTOINCREMENT,
             portfolio_id INTEGER NOT NULL,
             kind TEXT NOT NULL,                  -- 'CONTRIBUTION' or 'WITHDRAWAL'
-            amount REAL NOT NULL,                -- amount in portfolio currency
+            amount REAL NOT NULL,
             frequency TEXT NOT NULL,             -- 'monthly' or 'annual'
             start_date TEXT NOT NULL,            -- 'YYYY-MM-01'
             end_date TEXT,                       -- nullable
@@ -311,10 +319,7 @@ def run_forecast(
     write_to_db: bool = True,
     return_frames: bool = True,
 ) -> Dict[str, Any]:
-    if isinstance(params, dict):
-        fp = ForecastParams(**params)
-    else:
-        fp = params
+    fp = ForecastParams(**params) if isinstance(params, dict) else params
 
     conn = _connect(db_path)
     try:
@@ -331,7 +336,6 @@ def run_forecast(
         if fp.use_macro:
             macro_df = load_macro_forecast(conn)
         else:
-            # Build constant macro series using manual values with sane fallbacks
             g = fp.manual_growth if fp.manual_growth is not None else DEFAULT_GROWTH
             i = fp.manual_inflation if fp.manual_inflation is not None else DEFAULT_INFL
             x = fp.manual_fx if fp.manual_fx is not None else DEFAULT_FX
@@ -370,7 +374,7 @@ def run_forecast(
         run_id = None
         if write_to_db:
             _ensure_forecast_run_tables(conn)
-            _ensure_annual_columns(conn)  # make sure new columns exist
+            _ensure_annual_schema(conn)  # ensure clean new schema (migrates if necessary)
             run_id = _insert_forecast_run(conn, fp, settings)
             _write_results(conn, run_id, monthly_df, annual_df)
 
@@ -411,48 +415,130 @@ def _ensure_forecast_run_tables(conn: sqlite3.Connection) -> None:
             withdrawals REAL,
             PRIMARY KEY (run_id, period, portfolio_id)
         );
-        -- The annual table will be widened below by _ensure_annual_columns()
-        CREATE TABLE IF NOT EXISTS forecast_results_annual (
-            run_id INTEGER,
-            year INTEGER,
-            portfolio_id INTEGER,
-            portfolio_name TEXT,
-            tax_treatment TEXT,
-            after_tax_income REAL,
-            real_after_tax_income REAL,
-            taxes_paid REAL,
-            PRIMARY KEY (run_id, year, portfolio_id)
-        );
+        -- annual table is created/migrated by _ensure_annual_schema()
         """
     )
     conn.commit()
 
-def _get_table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
-    cur = conn.execute(f"PRAGMA table_info({table});")
-    return [r[1] for r in cur.fetchall()]
+# New canonical annual schema (no legacy columns)
+_ANNUAL_COLUMNS = [
+    ("run_id",                        "INTEGER"),
+    ("year",                          "INTEGER"),
+    ("portfolio_id",                  "INTEGER"),
+    ("portfolio_name",                "TEXT"),
+    ("tax_treatment",                 "TEXT"),
+    ("nominal_pretax_income",         "REAL"),
+    ("nominal_taxes_paid",            "REAL"),
+    ("nominal_after_tax_income",      "REAL"),
+    ("nominal_effective_tax_rate",    "REAL"),
+    ("real_pretax_income",            "REAL"),
+    ("real_taxes_paid",               "REAL"),
+    ("real_after_tax_income",         "REAL"),
+    ("real_effective_tax_rate",       "REAL"),
+    ("contributions",                 "REAL"),
+    ("withdrawals",                   "REAL")
+]
 
-def _ensure_annual_columns(conn: sqlite3.Connection) -> None:
-    """
-    Add the new columns to forecast_results_annual if they aren't present yet.
-    """
-    want = [
-        "nominal_pretax_income",
-        "nominal_taxes_paid",
-        "nominal_after_tax_income",
-        "nominal_effective_tax_rate",
-        "real_pretax_income",
-        "real_taxes_paid",
-        "real_after_tax_income",      # keep for safety; some DBs already have it
-        "real_effective_tax_rate",
-        "contributions",              # real terms
-        "withdrawals"                 # real terms
-    ]
-    have = set(_get_table_columns(conn, "forecast_results_annual"))
-
-    for col in want:
-        if col not in have:
-            conn.execute(f"ALTER TABLE forecast_results_annual ADD COLUMN {col} REAL;")
+def _create_annual_table(conn: sqlite3.Connection, table_name: str = "forecast_results_annual") -> None:
+    cols_sql = ",\n            ".join([f"{name} {typ}" for name, typ in _ANNUAL_COLUMNS])
+    pk = "PRIMARY KEY (run_id, year, portfolio_id)"
+    conn.executescript(f"""
+        CREATE TABLE IF NOT EXISTS {table_name} (
+            {cols_sql},
+            {pk}
+        );
+    """)
     conn.commit()
+
+def _ensure_annual_schema(conn: sqlite3.Connection) -> None:
+    """
+    Ensure forecast_results_annual has ONLY the new columns.
+    If legacy columns exist or columns are missing, migrate by rebuild.
+    """
+    if not _table_exists(conn, "forecast_results_annual"):
+        _create_annual_table(conn, "forecast_results_annual")
+        return
+
+    have = _get_table_columns(conn, "forecast_results_annual")
+    want = [c[0] for c in _ANNUAL_COLUMNS]
+
+    # Detect any mismatch (extra legacy columns or missing new ones)
+    if set(have) == set(want):
+        return  # already correct
+
+    # Build a new table, copy data (mapping from either new or legacy columns), swap it in.
+    conn.execute("BEGIN;")
+    try:
+        _create_annual_table(conn, "forecast_results_annual_new")
+
+        # Compose SELECT list with graceful fallbacks from legacy columns
+        # Legacy names that may exist:
+        #   after_tax_income, real_after_tax_income, taxes_paid, pretax_income, effective_tax_rate
+        select_exprs = [
+            "run_id",
+            "year",
+            "portfolio_id",
+            "portfolio_name",
+            "tax_treatment",
+
+            # nominal_pretax_income
+            "COALESCE(nominal_pretax_income, (COALESCE(after_tax_income,0)+COALESCE(taxes_paid,0))) AS nominal_pretax_income",
+            # nominal_taxes_paid
+            "COALESCE(nominal_taxes_paid, taxes_paid, 0.0) AS nominal_taxes_paid",
+            # nominal_after_tax_income
+            "COALESCE(nominal_after_tax_income, after_tax_income, 0.0) AS nominal_after_tax_income",
+            # nominal_effective_tax_rate
+            """COALESCE(
+                   nominal_effective_tax_rate,
+                   CASE WHEN (COALESCE(after_tax_income,0)+COALESCE(taxes_paid,0)) > 0
+                        THEN COALESCE(taxes_paid,0) * 1.0 / (COALESCE(after_tax_income,0)+COALESCE(taxes_paid,0))
+                        ELSE 0.0 END,
+                   0.0
+               ) AS nominal_effective_tax_rate""",
+
+            # real_pretax_income
+            """COALESCE(
+                   real_pretax_income,
+                   COALESCE(real_after_tax_income,0) + COALESCE(real_taxes_paid, 0.0),
+                   0.0
+               ) AS real_pretax_income""",
+            # real_taxes_paid
+            "COALESCE(real_taxes_paid, 0.0) AS real_taxes_paid",
+            # real_after_tax_income
+            "COALESCE(real_after_tax_income, 0.0) AS real_after_tax_income",
+            # real_effective_tax_rate
+            """COALESCE(
+                   real_effective_tax_rate,
+                   CASE WHEN (COALESCE(real_after_tax_income,0) + COALESCE(real_taxes_paid,0)) > 0
+                        THEN COALESCE(real_taxes_paid,0) * 1.0 / (COALESCE(real_after_tax_income,0) + COALESCE(real_taxes_paid,0))
+                        ELSE 0.0 END,
+                   0.0
+               ) AS real_effective_tax_rate""",
+
+            # contributions / withdrawals (real terms); default 0 if missing
+            "COALESCE(contributions, 0.0) AS contributions",
+            "COALESCE(withdrawals, 0.0) AS withdrawals",
+        ]
+
+        # Only copy if old table actually has rows
+        conn.execute(f"""
+            INSERT INTO forecast_results_annual_new (
+                {", ".join([c[0] for c in _ANNUAL_COLUMNS])}
+            )
+            SELECT
+                {", ".join(select_exprs)}
+            FROM forecast_results_annual;
+        """)
+
+        # Swap tables
+        conn.execute("ALTER TABLE forecast_results_annual RENAME TO forecast_results_annual_legacy_backup;")
+        conn.execute("ALTER TABLE forecast_results_annual_new RENAME TO forecast_results_annual;")
+        conn.execute("DROP TABLE IF EXISTS forecast_results_annual_legacy_backup;")
+
+        conn.commit()
+    except Exception:
+        conn.execute("ROLLBACK;")
+        raise
 
 def _insert_forecast_run(conn: sqlite3.Connection, fp: ForecastParams, settings: Dict[str, Any]) -> int:
     cur = conn.execute(
@@ -486,7 +572,7 @@ def _write_results(
     ]
     m[m_cols].to_sql("forecast_results_monthly", conn, if_exists="append", index=False)
 
-    # ---------- Annual (expanded) ----------
+    # ---------- Annual (new canonical schema) ----------
     a = annual_df.copy() if annual_df is not None else pd.DataFrame()
     if a.empty:
         a = pd.DataFrame(columns=["year","portfolio_id","portfolio","tax_treatment","after_tax","after_tax_real","taxes"])
@@ -502,15 +588,13 @@ def _write_results(
         if col not in a.columns:
             a[col] = None
 
-    # 1) Contributions/withdrawals in REAL terms: derive from monthly via deflator
+    # Contributions/withdrawals in REAL terms: derive from monthly via deflator
     mm = monthly_df.copy()
     mm["year"] = pd.to_datetime(mm["date"]).dt.year
-    # deflator = nominal / real; protect zeros/NaN
     defl = (pd.to_numeric(mm["value_nominal"], errors="coerce") /
             pd.to_numeric(mm["value_real"], errors="coerce"))
     defl = defl.replace([np.inf, -np.inf], np.nan).fillna(1.0)
     mm["_defl"] = defl
-
     for fld in ["contributions", "withdrawals"]:
         if fld not in mm.columns:
             mm[fld] = 0.0
@@ -521,7 +605,6 @@ def _write_results(
         .rename(columns={"contributions_real":"contributions", "withdrawals_real":"withdrawals"})
     )
 
-    # 2) Nominal & real income/tax fields + rates
     a_num = a.copy()
     a_num["after_tax_income"] = pd.to_numeric(a_num["after_tax_income"], errors="coerce").fillna(0.0)
     a_num["real_after_tax_income"] = pd.to_numeric(a_num["real_after_tax_income"], errors="coerce").fillna(0.0)
@@ -535,13 +618,11 @@ def _write_results(
         axis=1
     )
 
-    # Estimate per-row deflator from nominal vs real after-tax (fallback 1.0)
     est_defl = a_num.apply(
         lambda r: (r["after_tax_income"] / r["real_after_tax_income"]) if r["real_after_tax_income"] > 0 else 1.0,
         axis=1
     ).replace([np.inf, -np.inf], np.nan).fillna(1.0)
     a_num["_defl"] = est_defl
-
     a_num["real_taxes_paid"] = a_num["nominal_taxes_paid"] / a_num["_defl"].replace(0, 1.0)
     a_num["real_pretax_income"] = a_num["real_after_tax_income"] + a_num["real_taxes_paid"]
     a_num["real_effective_tax_rate"] = a_num.apply(
@@ -549,30 +630,18 @@ def _write_results(
         axis=1
     )
 
-    # 3) Merge in real flows
-    a_enriched = a_num.merge(
-        flows_real, on=["year","portfolio_id"], how="left"
-    )
+    a_enriched = a_num.merge(flows_real, on=["year","portfolio_id"], how="left")
     a_enriched[["contributions","withdrawals"]] = a_enriched[["contributions","withdrawals"]].fillna(0.0)
-
     a_enriched["run_id"] = run_id
 
-    # Ensure widened columns exist before insert (no-op if already done)
-    _ensure_annual_columns(conn)
+    # Ensure canonical schema exists
+    _ensure_annual_schema(conn)
 
-    # Final column order (tolerate legacy cols)
-    base_cols = ["run_id","year","portfolio_id","portfolio_name","tax_treatment"]
-    legacy_cols = ["after_tax_income","real_after_tax_income","taxes_paid"]
-    new_cols = [
-        "nominal_pretax_income","nominal_taxes_paid","nominal_after_tax_income","nominal_effective_tax_rate",
-        "real_pretax_income","real_taxes_paid","real_after_tax_income","real_effective_tax_rate",
-        "contributions","withdrawals"
-    ]
-    final_cols = [c for c in base_cols + legacy_cols + new_cols if c in a_enriched.columns]
-
-    # Upsert by replacing any existing (run_id, year, portfolio_id)
+    # Final column order (only new schema)
+    out_cols = [c[0] for c in _ANNUAL_COLUMNS]
+    # Upsert for run: replace any existing rows for run_id (simple delete-then-insert)
     conn.execute("DELETE FROM forecast_results_annual WHERE run_id = ?;", (run_id,))
     conn.commit()
 
-    a_enriched[final_cols].to_sql("forecast_results_annual", conn, if_exists="append", index=False)
+    a_enriched[out_cols].to_sql("forecast_results_annual", conn, if_exists="append", index=False)
     conn.commit()
