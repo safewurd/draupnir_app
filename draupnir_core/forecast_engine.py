@@ -6,6 +6,11 @@ Forecast Engine (callable)
 - Choice of valuation basis: "market" (live-price) or "book"
 - Maps portfolios → tax_treatment automatically via portfolios table
 - Uses portfolio_flows ONLY (ProjectionInputs removed)
+
+NEW:
+- Support manual (constant) macro assumptions when Use Macro Forecast is OFF.
+- Persist expanded annual table with nominal/real income & tax columns.
+- Write contributions/withdrawals in REAL terms at the annual level.
 """
 
 from __future__ import annotations
@@ -14,10 +19,11 @@ import json
 import sqlite3
 from dataclasses import dataclass, asdict
 from datetime import datetime
-from typing import Optional, Tuple, Dict, Any, Iterable
+from typing import Optional, Tuple, Dict, Any, Iterable, List
 import os
 
 import pandas as pd
+import numpy as np
 import yfinance as yf
 
 # ---------- Robust imports for core math ----------
@@ -27,16 +33,22 @@ try:
         build_inflation_factors,
         simulate_portfolio_growth,
         apply_taxes,
+        DEFAULT_GROWTH,
+        DEFAULT_INFL,
+        DEFAULT_FX,
     )
-    from . import tax_engine as tax_engine
+    from . import tax_engine as tax_engine  # noqa: F401  (kept for compatibility)
 except Exception:
     from draupnir import (
         get_macro_rates,
         build_inflation_factors,
         simulate_portfolio_growth,
         apply_taxes,
+        DEFAULT_GROWTH,
+        DEFAULT_INFL,
+        DEFAULT_FX,
     )
-    import tax_engine as tax_engine
+    import tax_engine as tax_engine  # noqa: F401
 
 # ---- Unified DB default ----
 os.makedirs("data", exist_ok=True)
@@ -52,9 +64,12 @@ class ForecastParams:
     cadence: str = "monthly"
     start_date: Optional[str] = None
     use_macro: bool = True
-    inflation_mode: Optional[str] = None
-    growth_mode: Optional[str] = None
-    fx_mode: Optional[str] = None
+
+    # MANUAL (constant) assumptions when use_macro=False
+    manual_growth: Optional[float] = None      # annual (e.g., 0.07 for 7%)
+    manual_inflation: Optional[float] = None   # annual (e.g., 0.02 for 2%)
+    manual_fx: Optional[float] = None          # scalar
+
     notes: Optional[str] = None
 
     # Seed from holdings
@@ -281,6 +296,15 @@ def _flows_to_monthly_inputs(flows: pd.DataFrame) -> pd.DataFrame:
 # Core runner
 # -----------------------------
 
+def _constant_macro_df(years: int, growth: float, inflation: float, fx: float) -> pd.DataFrame:
+    yrs = list(range(0, max(120, int(years) + 1)))
+    return pd.DataFrame({
+        "year": yrs,
+        "growth": [float(growth)] * len(yrs),
+        "inflation": [float(inflation)] * len(yrs),
+        "fx": [float(fx)] * len(yrs),
+    })
+
 def run_forecast(
     db_path: str = DB_PATH_DEFAULT,
     params: ForecastParams | Dict[str, Any] = ForecastParams(),
@@ -294,14 +318,8 @@ def run_forecast(
 
     conn = _connect(db_path)
     try:
-        # Global settings
+        # Global settings (kept, but no longer drive macro modes)
         settings = _load_global_settings(conn)
-
-        # Per-run overrides
-        for k in ("inflation_mode", "growth_mode", "fx_mode"):
-            v = getattr(fp, k)
-            if v:
-                settings[k] = str(v).lower()
 
         # Seed assets
         if fp.seed_from_holdings:
@@ -309,13 +327,21 @@ def run_forecast(
         else:
             assets_df = load_assets(conn)
 
-        macro_df  = load_macro_forecast(conn) if fp.use_macro else pd.DataFrame()
+        # Macro:
+        if fp.use_macro:
+            macro_df = load_macro_forecast(conn)
+        else:
+            # Build constant macro series using manual values with sane fallbacks
+            g = fp.manual_growth if fp.manual_growth is not None else DEFAULT_GROWTH
+            i = fp.manual_inflation if fp.manual_inflation is not None else DEFAULT_INFL
+            x = fp.manual_fx if fp.manual_fx is not None else DEFAULT_FX
+            macro_df = _constant_macro_df(fp.years, g, i, x)
+
         income_df = load_employment_income(conn)
 
         # Portfolio flows (single source of truth)
         flows_df = load_portfolio_flows(conn)
         inputs_df = _flows_to_monthly_inputs(flows_df)
-        # Ensure expected columns exist even if empty
         if inputs_df.empty:
             inputs_df = pd.DataFrame(columns=["portfolio_id","monthly_contribution","monthly_withdrawal","index_with_inflation"])
 
@@ -344,6 +370,7 @@ def run_forecast(
         run_id = None
         if write_to_db:
             _ensure_forecast_run_tables(conn)
+            _ensure_annual_columns(conn)  # make sure new columns exist
             run_id = _insert_forecast_run(conn, fp, settings)
             _write_results(conn, run_id, monthly_df, annual_df)
 
@@ -384,6 +411,7 @@ def _ensure_forecast_run_tables(conn: sqlite3.Connection) -> None:
             withdrawals REAL,
             PRIMARY KEY (run_id, period, portfolio_id)
         );
+        -- The annual table will be widened below by _ensure_annual_columns()
         CREATE TABLE IF NOT EXISTS forecast_results_annual (
             run_id INTEGER,
             year INTEGER,
@@ -397,6 +425,33 @@ def _ensure_forecast_run_tables(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    conn.commit()
+
+def _get_table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
+    cur = conn.execute(f"PRAGMA table_info({table});")
+    return [r[1] for r in cur.fetchall()]
+
+def _ensure_annual_columns(conn: sqlite3.Connection) -> None:
+    """
+    Add the new columns to forecast_results_annual if they aren't present yet.
+    """
+    want = [
+        "nominal_pretax_income",
+        "nominal_taxes_paid",
+        "nominal_after_tax_income",
+        "nominal_effective_tax_rate",
+        "real_pretax_income",
+        "real_taxes_paid",
+        "real_after_tax_income",      # keep for safety; some DBs already have it
+        "real_effective_tax_rate",
+        "contributions",              # real terms
+        "withdrawals"                 # real terms
+    ]
+    have = set(_get_table_columns(conn, "forecast_results_annual"))
+
+    for col in want:
+        if col not in have:
+            conn.execute(f"ALTER TABLE forecast_results_annual ADD COLUMN {col} REAL;")
     conn.commit()
 
 def _insert_forecast_run(conn: sqlite3.Connection, fp: ForecastParams, settings: Dict[str, Any]) -> int:
@@ -413,9 +468,8 @@ def _write_results(
     monthly_df: pd.DataFrame,
     annual_df: pd.DataFrame,
 ) -> None:
+    # ---------- Monthly ----------
     m = monthly_df.copy()
-    a = annual_df.copy()
-
     m = m.rename(columns={
         "date": "period",
         "portfolio": "portfolio_name",
@@ -425,6 +479,17 @@ def _write_results(
     for col in ["period","portfolio_id","portfolio_name","tax_treatment","nominal_value","real_value","contributions","withdrawals"]:
         if col not in m.columns:
             m[col] = None
+    m["run_id"] = run_id
+    m_cols = [
+        "run_id","period","portfolio_id","portfolio_name","tax_treatment",
+        "nominal_value","real_value","contributions","withdrawals"
+    ]
+    m[m_cols].to_sql("forecast_results_monthly", conn, if_exists="append", index=False)
+
+    # ---------- Annual (expanded) ----------
+    a = annual_df.copy() if annual_df is not None else pd.DataFrame()
+    if a.empty:
+        a = pd.DataFrame(columns=["year","portfolio_id","portfolio","tax_treatment","after_tax","after_tax_real","taxes"])
 
     a = a.rename(columns={
         "year": "year",
@@ -437,18 +502,77 @@ def _write_results(
         if col not in a.columns:
             a[col] = None
 
-    m["run_id"] = run_id
-    a["run_id"] = run_id
+    # 1) Contributions/withdrawals in REAL terms: derive from monthly via deflator
+    mm = monthly_df.copy()
+    mm["year"] = pd.to_datetime(mm["date"]).dt.year
+    # deflator = nominal / real; protect zeros/NaN
+    defl = (pd.to_numeric(mm["value_nominal"], errors="coerce") /
+            pd.to_numeric(mm["value_real"], errors="coerce"))
+    defl = defl.replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    mm["_defl"] = defl
 
-    m_cols = [
-        "run_id","period","portfolio_id","portfolio_name","tax_treatment",
-        "nominal_value","real_value","contributions","withdrawals"
-    ]
-    a_cols = [
-        "run_id","year","portfolio_id","portfolio_name","tax_treatment",
-        "after_tax_income","real_after_tax_income","taxes_paid"
-    ]
+    for fld in ["contributions", "withdrawals"]:
+        if fld not in mm.columns:
+            mm[fld] = 0.0
+        mm[f"{fld}_real"] = pd.to_numeric(mm[fld], errors="coerce").fillna(0.0) / mm["_defl"].replace(0, 1.0)
 
-    m[m_cols].to_sql("forecast_results_monthly", conn, if_exists="append", index=False)
-    a[a_cols].to_sql("forecast_results_annual",  conn, if_exists="append", index=False)
+    flows_real = (
+        mm.groupby(["year","portfolio_id"], as_index=False)[["contributions_real","withdrawals_real"]].sum()
+        .rename(columns={"contributions_real":"contributions", "withdrawals_real":"withdrawals"})
+    )
+
+    # 2) Nominal & real income/tax fields + rates
+    a_num = a.copy()
+    a_num["after_tax_income"] = pd.to_numeric(a_num["after_tax_income"], errors="coerce").fillna(0.0)
+    a_num["real_after_tax_income"] = pd.to_numeric(a_num["real_after_tax_income"], errors="coerce").fillna(0.0)
+    a_num["taxes_paid"] = pd.to_numeric(a_num["taxes_paid"], errors="coerce").fillna(0.0)
+
+    a_num["nominal_pretax_income"] = a_num["after_tax_income"] + a_num["taxes_paid"]
+    a_num["nominal_taxes_paid"] = a_num["taxes_paid"]
+    a_num["nominal_after_tax_income"] = a_num["after_tax_income"]
+    a_num["nominal_effective_tax_rate"] = a_num.apply(
+        lambda r: (r["nominal_taxes_paid"] / r["nominal_pretax_income"]) if r["nominal_pretax_income"] > 0 else 0.0,
+        axis=1
+    )
+
+    # Estimate per-row deflator from nominal vs real after-tax (fallback 1.0)
+    est_defl = a_num.apply(
+        lambda r: (r["after_tax_income"] / r["real_after_tax_income"]) if r["real_after_tax_income"] > 0 else 1.0,
+        axis=1
+    ).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    a_num["_defl"] = est_defl
+
+    a_num["real_taxes_paid"] = a_num["nominal_taxes_paid"] / a_num["_defl"].replace(0, 1.0)
+    a_num["real_pretax_income"] = a_num["real_after_tax_income"] + a_num["real_taxes_paid"]
+    a_num["real_effective_tax_rate"] = a_num.apply(
+        lambda r: (r["real_taxes_paid"] / r["real_pretax_income"]) if r["real_pretax_income"] > 0 else 0.0,
+        axis=1
+    )
+
+    # 3) Merge in real flows
+    a_enriched = a_num.merge(
+        flows_real, on=["year","portfolio_id"], how="left"
+    )
+    a_enriched[["contributions","withdrawals"]] = a_enriched[["contributions","withdrawals"]].fillna(0.0)
+
+    a_enriched["run_id"] = run_id
+
+    # Ensure widened columns exist before insert (no-op if already done)
+    _ensure_annual_columns(conn)
+
+    # Final column order (tolerate legacy cols)
+    base_cols = ["run_id","year","portfolio_id","portfolio_name","tax_treatment"]
+    legacy_cols = ["after_tax_income","real_after_tax_income","taxes_paid"]
+    new_cols = [
+        "nominal_pretax_income","nominal_taxes_paid","nominal_after_tax_income","nominal_effective_tax_rate",
+        "real_pretax_income","real_taxes_paid","real_after_tax_income","real_effective_tax_rate",
+        "contributions","withdrawals"
+    ]
+    final_cols = [c for c in base_cols + legacy_cols + new_cols if c in a_enriched.columns]
+
+    # Upsert by replacing any existing (run_id, year, portfolio_id)
+    conn.execute("DELETE FROM forecast_results_annual WHERE run_id = ?;", (run_id,))
+    conn.commit()
+
+    a_enriched[final_cols].to_sql("forecast_results_annual", conn, if_exists="append", index=False)
     conn.commit()

@@ -47,73 +47,92 @@ def _get_setting(key: str) -> str | None:
         conn.close()
 
 # -----------------------------
-# Annual summary builder
+# Introspection helpers
 # -----------------------------
 
-def _build_annual_summary(monthly_df: pd.DataFrame, annual_df: pd.DataFrame) -> pd.DataFrame:
+def _get_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table});").fetchall()
+        return {r[1] for r in rows}  # r[1] = name
+    except Exception:
+        return set()
+
+def _monthly_real_value_column(conn: sqlite3.Connection) -> str | None:
     """
-    Output columns (year-level, summed across portfolios):
-      year
-      value_real                -> sum of end-of-year real values across portfolios
-      contributions             -> sum of monthly contributions during the year
-      withdrawals               -> sum of monthly withdrawals during the year
-      pretax_income             -> sum(after_tax_income + taxes_paid) for the year (nominal)
-      real_after_tax_income     -> sum of real_after_tax_income for the year
-      effective_tax_rate        -> taxes_paid / pretax_income  (0 if denom=0)
+    Return the correct column name to read the end-of-month real value from
+    forecast_results_monthly. New writer uses 'real_value'. Legacy rows might have 'value_real'.
     """
-    if monthly_df is None or monthly_df.empty:
-        return pd.DataFrame(columns=[
-            "year","value_real","contributions","withdrawals","pretax_income","real_after_tax_income","effective_tax_rate"
-        ])
-
-    m = monthly_df.copy()
-    m["year"] = pd.to_datetime(m["date"]).dt.year
-
-    # end-of-year real value per portfolio → then sum across portfolios
-    m_sorted = m.sort_values(["year", "portfolio_id", "date"])
-    last_per_pf_year = (
-        m_sorted.groupby(["year", "portfolio_id"], as_index=False)
-        .tail(1)[["year", "portfolio_id", "value_real"]]
-    )
-    end_value_by_year = last_per_pf_year.groupby("year")["value_real"].sum().rename("value_real")
-
-    contrib_by_year = m.groupby("year")["contributions"].sum().rename("contributions")
-    withdr_by_year  = m.groupby("year")["withdrawals"].sum().rename("withdrawals")
-
-    a = annual_df.copy() if annual_df is not None else pd.DataFrame(columns=["year","after_tax_income","real_after_tax_income","taxes_paid"])
-    if not a.empty:
-        a["pretax_income"] = pd.to_numeric(a["after_tax_income"], errors="coerce").fillna(0.0) + \
-                             pd.to_numeric(a["taxes_paid"], errors="coerce").fillna(0.0)
-        a_grp = a.groupby("year").agg(
-            pretax_income=("pretax_income", "sum"),
-            real_after_tax_income=("real_after_tax_income", "sum"),
-            taxes_paid=("taxes_paid", "sum"),
-        )
-    else:
-        a_grp = pd.DataFrame(columns=["pretax_income","real_after_tax_income","taxes_paid"])
-
-    # join all parts
-    years = sorted(set(end_value_by_year.index) | set(contrib_by_year.index) | set(withdr_by_year.index) | set(a_grp.index))
-    out = pd.DataFrame({"year": years}).set_index("year")
-
-    for ser in (end_value_by_year, contrib_by_year, withdr_by_year):
-        out = out.join(ser, how="left")
-
-    out = out.join(a_grp, how="left")
-    out = out.fillna({"value_real": 0.0, "contributions": 0.0, "withdrawals": 0.0,
-                      "pretax_income": 0.0, "real_after_tax_income": 0.0, "taxes_paid": 0.0})
-
-    # effective tax rate
-    denom = out["pretax_income"].replace(0, pd.NA)
-    out["effective_tax_rate"] = (out["taxes_paid"] / denom).fillna(0.0)
-
-    # final order
-    out = out[["value_real","contributions","withdrawals","pretax_income","real_after_tax_income","effective_tax_rate"]]
-    out = out.reset_index()
-    return out
+    cols = _get_columns(conn, "forecast_results_monthly")
+    if "real_value" in cols:
+        return "real_value"
+    if "value_real" in cols:
+        return "value_real"
+    return None
 
 # -----------------------------
-# Export (single sheet: Annual Summary)
+# Annual results loader (from DB)
+# -----------------------------
+
+def _load_annual_results_for_run(run_id: int) -> pd.DataFrame:
+    conn = _connect(DB_PATH)
+    try:
+        if not _table_exists(conn, "forecast_results_annual"):
+            return pd.DataFrame()
+
+        # Pull the expanded annual rows (per-portfolio; we'll aggregate later)
+        # We rely on the NEW columns only; older legacy columns are present but not used here.
+        a = pd.read_sql("""
+            SELECT
+                year,
+                portfolio_id,
+                contributions,
+                withdrawals,
+                real_pretax_income,
+                real_taxes_paid,
+                real_after_tax_income,
+                real_effective_tax_rate
+            FROM forecast_results_annual
+            WHERE run_id = ?
+        """, conn, params=(run_id,))
+
+        # Bring in year-end value_real (per portfolio) from monthly table
+        if not _table_exists(conn, "forecast_results_monthly"):
+            a["value_real"] = 0.0
+            return a
+
+        real_col = _monthly_real_value_column(conn)
+        if not real_col:
+            # Neither 'real_value' nor legacy 'value_real' exist → treat as zero to avoid crash
+            a["value_real"] = 0.0
+            return a
+
+        # Build a query that uses the single, actually-existing column name and alias it to value_real
+        m_sql = f"""
+            SELECT year, portfolio_id, value_real
+            FROM (
+                SELECT
+                    CAST(strftime('%Y', period) AS INTEGER) AS year,
+                    portfolio_id,
+                    {real_col} AS value_real,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY CAST(strftime('%Y', period) AS INTEGER), portfolio_id
+                        ORDER BY period DESC
+                    ) AS rn
+                FROM forecast_results_monthly
+                WHERE run_id = ?
+            ) t
+            WHERE rn = 1
+        """
+        m = pd.read_sql(m_sql, conn, params=(run_id,))
+
+        out = a.merge(m, on=["year","portfolio_id"], how="left")
+        out["value_real"] = pd.to_numeric(out["value_real"], errors="coerce").fillna(0.0)
+        return out
+    finally:
+        conn.close()
+
+# -----------------------------
+# Export (single sheet: Annual Results)
 # -----------------------------
 
 def _export_excel_ui(summary_df: pd.DataFrame, run_id: int | None):
@@ -134,8 +153,8 @@ def _export_excel_ui(summary_df: pd.DataFrame, run_id: int | None):
 
         bio = BytesIO()
         with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-            summary_df.to_excel(writer, index=False, sheet_name="Annual_Summary")
-            ws = writer.sheets["Annual_Summary"]
+            summary_df.to_excel(writer, index=False, sheet_name="Annual_Results")
+            ws = writer.sheets["Annual_Results"]
             for col_cells in ws.columns:
                 length = max(len(str(cell.value)) if cell.value is not None else 0 for cell in col_cells)
                 ws.column_dimensions[col_cells[0].column_letter].width = min(max(length + 2, 12), 50)
@@ -158,8 +177,8 @@ def _export_excel_ui(summary_df: pd.DataFrame, run_id: int | None):
 
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        summary_df.to_excel(writer, index=False, sheet_name="Annual_Summary")
-        ws = writer.sheets["Annual_Summary"]
+        summary_df.to_excel(writer, index=False, sheet_name="Annual_Results")
+        ws = writer.sheets["Annual_Results"]
         for col_cells in ws.columns:
             length = max(len(str(cell.value)) if cell.value is not None else 0 for cell in col_cells)
             ws.column_dimensions[col_cells[0].column_letter].width = min(max(length + 2, 12), 50)
@@ -176,7 +195,7 @@ def _export_excel_ui(summary_df: pd.DataFrame, run_id: int | None):
     )
 
 # -----------------------------
-# Cash Flows CRUD (unchanged helpers)
+# Cash Flows CRUD
 # -----------------------------
 
 def _ensure_flows_table():
@@ -227,7 +246,7 @@ def _load_flows_for_portfolio(pid: int) -> pd.DataFrame:
         conn.close()
 
 # -----------------------------
-# Assumptions editors (unchanged)
+# Assumptions editors
 # -----------------------------
 
 def _ensure_macro_table():
@@ -361,7 +380,7 @@ def forecast_tab():
 
     st.markdown("---")
 
-    # ========== B) Assumptions Editor ==========
+    # ========== B) Assumptions ==========
     st.markdown("## 🧭 Assumptions")
 
     # -- Macro Forecast table editor
@@ -430,27 +449,24 @@ def forecast_tab():
             years = st.number_input("Years to simulate", min_value=1, max_value=100, value=30, step=1)
             use_macro = st.checkbox("Use Macro Forecast", value=True)
         with col2:
-            inflation_override = st.selectbox(
-                "Inflation mode override", options=["(use global)", "static", "dynamic", "market implied"], index=0
-            )
-            growth_override = st.selectbox(
-                "Growth mode override", options=["(use global)", "static", "dynamic"], index=0
-            )
+            # Whole-percent inputs: 10 => 10% = 0.10
+            manual_growth_pct = st.number_input("Manual Growth (%)", min_value=0.0, value=7.0, step=1.0, format="%.0f")
+            manual_infl_pct   = st.number_input("Manual Inflation (%)", min_value=0.0, value=2.0, step=1.0, format="%.0f")
         with col3:
-            fx_override = st.selectbox(
-                "FX mode override", options=["(use global)", "static", "dynamic"], index=0
-            )
+            manual_fx = st.number_input("Manual FX (scalar)", min_value=0.0, value=1.00, step=0.01, format="%.2f")
             start_date = st.text_input("Start date (YYYY-MM-01)", value="", placeholder="optional")
 
         submitted = st.form_submit_button("Run Forecast", use_container_width=True)
 
+    # ⛔ Only run when the user clicks the button
     if not submitted:
         st.info("Set your assumptions and click **Run Forecast**.")
         return
 
-    infl_mode = None if inflation_override.startswith("(") else inflation_override.lower()
-    gr_mode = None if growth_override.startswith("(") else growth_override.lower()
-    fx_mode = None if fx_override.startswith("(") else fx_override.lower()
+    # Convert whole % inputs to decimals
+    mg = float(manual_growth_pct) / 100.0
+    mi = float(manual_infl_pct)   / 100.0
+    mx = float(manual_fx)
     start_date_val = start_date.strip() or None
 
     with st.spinner("Running forecast…"):
@@ -462,10 +478,13 @@ def forecast_tab():
                     cadence="monthly",
                     start_date=start_date_val,
                     use_macro=bool(use_macro),
-                    inflation_mode=infl_mode,
-                    growth_mode=gr_mode,
-                    fx_mode=fx_mode,
-                    # 🔑 NEW: seed from current holdings at market (fallback to book in engine)
+
+                    # Used only when use_macro=False
+                    manual_growth=mg,
+                    manual_inflation=mi,
+                    manual_fx=mx,
+
+                    # Seed from current holdings at market
                     seed_from_holdings=True,
                     holdings_valuation="market",
                 ),
@@ -477,28 +496,40 @@ def forecast_tab():
             return
 
     run_id = out.get("run_id")
-    monthly_df: pd.DataFrame | None = out.get("monthly_df")
-    annual_df: pd.DataFrame | None = out.get("annual_df")
-
     c1, c2 = st.columns(2)
     c1.success(f"✅ Forecast complete (run_id={run_id}).")
-    params = out.get("params", {})
-    c2.caption(f"Seeded from: holdings • years={params.get('years')} • "
-               f"infl={params.get('inflation_mode') or 'global'} • "
-               f"growth={params.get('growth_mode') or 'global'} • "
-               f"fx={params.get('fx_mode') or 'global'}.")
+    if use_macro:
+        c2.caption(f"Assumptions: MacroForecast table • years={int(years)}.")
+    else:
+        c2.caption(f"Assumptions: manual constants • growth={mg:.4f}, infl={mi:.4f}, fx={mx:.4f} • years={int(years)}.")
 
-    # ---------- NEW: Single annual results table ----------
+    # ---------- Annual results table (summed across portfolios) ----------
     st.markdown("### 📊 Annual Results (summed across portfolios)")
-    summary_df = _build_annual_summary(monthly_df, annual_df)
-    if summary_df.empty:
+    raw = _load_annual_results_for_run(run_id)
+    if raw.empty:
         st.info("No results to display.")
     else:
-        # nice formatting: show effective tax rate as percentage for readability
-        display = summary_df.copy()
-        if "effective_tax_rate" in display.columns:
-            display["effective_tax_rate"] = (display["effective_tax_rate"] * 100.0).round(2)
+        # Aggregate across portfolios and recompute effective tax rate on the totals
+        g = (raw.groupby("year", as_index=False)[
+            ["value_real","contributions","withdrawals","real_pretax_income","real_taxes_paid","real_after_tax_income"]
+        ].sum(numeric_only=True))
+
+        g["real_effective_tax_rate"] = g.apply(
+            lambda r: (r["real_taxes_paid"] / r["real_pretax_income"]) if r["real_pretax_income"] else 0.0, axis=1
+        )
+
+        display = g[[
+            "year",
+            "value_real",
+            "contributions",
+            "withdrawals",
+            "real_pretax_income",
+            "real_taxes_paid",
+            "real_after_tax_income",
+            "real_effective_tax_rate",
+        ]].copy()
+
         st.dataframe(display, use_container_width=True, hide_index=True)
 
-    # Export (single sheet)
-    _export_excel_ui(summary_df, run_id)
+        # Export (single sheet)
+        _export_excel_ui(display, run_id)

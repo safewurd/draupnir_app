@@ -13,10 +13,6 @@ DB_PATH = get_db_path()  # <-- absolute path for THIS machine
 
 # ---------- Default Option Lists ----------
 BASE_CURRENCY_OPTIONS = ["CAD", "USD"]
-FX_MODE_OPTIONS = ["static", "dynamic"]
-INFLATION_MODE_OPTIONS = ["static", "dynamic", "market implied"]
-GROWTH_MODE_OPTIONS = ["static", "dynamic"]
-MACRO_MODE_OPTIONS = ["static", "forecast", "custom"]
 MARKET_DATA_PROVIDER_OPTIONS = ["yahoo", "alpha_vantage", "polygon"]
 
 # ---------- Table Management ----------
@@ -189,7 +185,6 @@ def insert_portfolio(owner: str, institution: str, tax_treatment: str, account_n
 
 # ---------- UI Tab ----------
 def settings_tab():
-    
     create_settings_tables()
     settings = get_settings()
 
@@ -224,29 +219,14 @@ def settings_tab():
 
     st.divider()
 
-    # --- Editable Global Settings ---
+    # --- Editable Global Settings (trimmed per your request) ---
     st.markdown("### 🌍 Projection Defaults")
 
     base_currency = st.selectbox(
         "Base Currency", BASE_CURRENCY_OPTIONS,
         index=BASE_CURRENCY_OPTIONS.index(settings.get("base_currency", "CAD"))
     )
-    fx_mode = st.selectbox(
-        "FX Mode", FX_MODE_OPTIONS,
-        index=FX_MODE_OPTIONS.index(settings.get("fx_mode", "static"))
-    )
-    inflation_mode = st.selectbox(
-        "Inflation Mode", INFLATION_MODE_OPTIONS,
-        index=INFLATION_MODE_OPTIONS.index(settings.get("inflation_mode", "static"))
-    )
-    growth_mode = st.selectbox(
-        "Growth Mode", GROWTH_MODE_OPTIONS,
-        index=GROWTH_MODE_OPTIONS.index(settings.get("growth_mode", "static"))
-    )
-    macro_mode = st.selectbox(
-        "Macro Mode", MACRO_MODE_OPTIONS,
-        index=MACRO_MODE_OPTIONS.index(settings.get("macro_mode", "static"))
-    )
+
     market_data_provider = st.selectbox(
         "Market Data Provider", MARKET_DATA_PROVIDER_OPTIONS,
         index=MARKET_DATA_PROVIDER_OPTIONS.index(settings.get("market_data_provider", "yahoo"))
@@ -257,19 +237,14 @@ def settings_tab():
     forecast_output_dir = st.text_input(
         "Forecast Output Directory",
         value=settings.get("forecast_output_dir", ""),
-        placeholder=r"C:\Users\you\Documents\Draupnir\Forecasts (or /Users/you/Draupnir/Forecasts)"
+        placeholder=r"C:\Users\you\Documents\Draupnir\Forecasts (or /Users/you/Draupnir\Forecasts)"
     )
     if forecast_output_dir:
         st.caption(f"Will save forecast Excel files to: `{os.path.abspath(forecast_output_dir)}`")
 
     if st.button("💾 Save Settings"):
         set_setting("base_currency", base_currency)
-        set_setting("fx_mode", fx_mode)
-        set_setting("inflation_mode", inflation_mode)
-        set_setting("growth_mode", growth_mode)
-        set_setting("macro_mode", macro_mode)
         set_setting("market_data_provider", market_data_provider)
-        # Save new output dir
         set_setting("forecast_output_dir", forecast_output_dir.strip())
         st.success("✅ Settings saved.")
 
