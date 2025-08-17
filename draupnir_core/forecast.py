@@ -443,14 +443,14 @@ def forecast_tab():
     with st.form("forecast_form"):
         col1, col2, col3 = st.columns(3)
         with col1:
-            years = st.number_input("Years to simulate", min_value=1, max_value=100, value=30, step=1)
+            years = st.number_input("Years to simulate", min_value=1, max_value=100, value=40, step=1)
             use_macro = st.checkbox("Use Macro Forecast", value=True)
         with col2:
             # Whole-percent inputs: 10 => 10% = 0.10
-            manual_growth_pct = st.number_input("Manual Growth (%)", min_value=0.0, value=7.0, step=1.0, format="%.0f")
-            manual_infl_pct   = st.number_input("Manual Inflation (%)", min_value=0.0, value=2.0, step=1.0, format="%.0f")
+            manual_growth_pct = st.number_input("Manual Growth (%)", min_value=0.0, value=10.0, step=0.5, format="%.0f")
+            manual_infl_pct   = st.number_input("Manual Inflation (%)", min_value=0.0, value=3.0, step=0.5, format="%.0f")
         with col3:
-            manual_fx = st.number_input("Manual FX (scalar)", min_value=0.0, value=1.00, step=0.01, format="%.2f")
+            manual_fx = st.number_input("Manual FX (scalar)", min_value=1.0, value=1.37, step=0.01, format="%.2f")
             start_date = st.text_input("Start date (YYYY-MM-01)", value="", placeholder="optional")
 
         submitted = st.form_submit_button("Run Forecast", use_container_width=True)

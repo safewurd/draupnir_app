@@ -52,22 +52,11 @@ except Exception as ex:
 
 # ---------------- Header ----------------
 st.markdown("# 🧠 Draupnir Portfolio Management")
-st.markdown("Welcome to your private wealth analysis and projection system.")
+st.markdown("Welcome to your private portfolio management and forecasting system.")
 st.caption(f"DB: `{DB_PATH}`")
 
-# (Optional) quick peek at tables; comment out later if you like
-try:
-    with sqlite3.connect(DB_PATH) as _conn:
-        _tbls = [r[0] for r in _conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name;"
-        ).fetchall()]
-    if _tbls:
-        st.caption("Tables: " + ", ".join(_tbls))
-except Exception:
-    pass
-
 # ---------------- Tabs ----------------
-tabs = st.tabs(["📈 Summary", "📁 Portfolio", "🔮 Forecast", "📄 Trade Blotter", "⚙️ Settings"])
+tabs = st.tabs(["Summary", "Portfolio", "Forecast", "Trade Blotter", "Settings"])
 
 with tabs[0]:
     summary_tab()
