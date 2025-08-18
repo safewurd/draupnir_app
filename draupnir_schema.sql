@@ -56,7 +56,7 @@ CREATE TABLE "forecast_results_annual" (
             real_after_tax_income REAL,
             real_effective_tax_rate REAL,
             contributions REAL,
-            withdrawals REAL,
+            withdrawals REAL, dividend_income_base REAL, interest_income_base REAL, dividends_reinvested_base REAL, interest_reinvested_base REAL,
             PRIMARY KEY (run_id, year, portfolio_id)
         );
 
@@ -69,7 +69,7 @@ CREATE TABLE forecast_results_monthly (
             nominal_value REAL,
             real_value REAL,
             contributions REAL,
-            withdrawals REAL, is_t0 INTEGER DEFAULT 0,
+            withdrawals REAL, is_t0 INTEGER DEFAULT 0, cash_flow_from_distributions_base REAL, dividend_income_base REAL, interest_income_base REAL, dividends_reinvested_base REAL, interest_reinvested_base REAL,
             PRIMARY KEY (run_id, period, portfolio_id)
         );
 
@@ -103,7 +103,7 @@ CREATE TABLE portfolio_flows (
             created_at TEXT DEFAULT (datetime('now'))
         );
 
-CREATE TABLE "portfolios" ("portfolio_id" INTEGER, "account_number" VARCHAR(20) NOT NULL, "portfolio_name" VARCHAR(50) NOT NULL, "portfolio_owner" VARCHAR(100) NOT NULL, "institution" VARCHAR(50), "created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "tax_treatment" TEXT, PRIMARY KEY ("portfolio_id"));
+CREATE TABLE "portfolios" ("portfolio_id" INTEGER, "account_number" VARCHAR(20) NOT NULL, "portfolio_name" VARCHAR(50) NOT NULL, "portfolio_owner" VARCHAR(100) NOT NULL, "institution" VARCHAR(50), "created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "tax_treatment" TEXT, interest_yield REAL, div_eligible_yield REAL, div_noneligible_yield REAL, reinvest_interest INTEGER DEFAULT 1, reinvest_dividends INTEGER DEFAULT 1, PRIMARY KEY ("portfolio_id"));
 
 CREATE TABLE settings (
             key TEXT PRIMARY KEY,
@@ -111,6 +111,32 @@ CREATE TABLE settings (
         );
 
 CREATE TABLE sqlite_sequence(name,seq);
+
+CREATE TABLE tax_distribution_assumptions(
+        scope TEXT PRIMARY KEY,
+        interest_yield REAL NOT NULL,
+        eligible_div_yield REAL NOT NULL,
+        noneligible_div_yield REAL NOT NULL,
+        last_updated TEXT
+    );
+
+CREATE TABLE tax_policy(
+        year INTEGER NOT NULL,
+        province TEXT NOT NULL,
+        cap_gains_inclusion REAL NOT NULL,
+        eligible_div_gross_up REAL NOT NULL,
+        noneligible_div_gross_up REAL NOT NULL,
+        fed_eligible_div_credit_rate REAL NOT NULL,
+        fed_noneligible_div_credit_rate REAL NOT NULL,
+        prov_eligible_div_credit_rate REAL NOT NULL,
+        prov_noneligible_div_credit_rate REAL NOT NULL,
+        PRIMARY KEY (year, province)
+    );
+
+CREATE TABLE tax_profile(
+        year INTEGER PRIMARY KEY,
+        province TEXT NOT NULL
+    );
 
 CREATE TABLE tax_treatments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -71,6 +71,11 @@ Pull latest changes
 
 git pull
 
+Hard git pull:
+
+git reset --hard HEAD      # throw away local changes
+git pull                   # now bring in latest from remote
+
 
 Activate venv
 
