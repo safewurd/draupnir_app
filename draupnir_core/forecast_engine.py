@@ -11,6 +11,10 @@ Forecast Engine
 - Dividends are split:
     *eligible* (CAD-weighted portion OR explicit column) vs *non-eligible* (everything else).
 - Persists only split dividend fields + interest in results tables (no generic dividend totals).
+
+IMPORTANT:
+When reinvestment is ON, the reinvested amount is added to the month it occurs AND is now
+carried forward into all future months using the baseline month-to-month growth factors.
 """
 
 from __future__ import annotations
@@ -90,11 +94,14 @@ def _get_table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
         return []
 
 def _load_df(conn: sqlite3.Connection, sql: str, params: Tuple = ()) -> pd.DataFrame:
-    try: return pd.read_sql(sql, conn, params=params)
-    except Exception: return pd.DataFrame()
+    try:
+        return pd.read_sql(sql, conn, params=params)
+    except Exception:
+        return pd.DataFrame()
 
 def _load_global_settings(conn: sqlite3.Connection) -> Dict[str, Any]:
-    if not _table_exists(conn, "global_settings"): return {}
+    if not _table_exists(conn, "global_settings"):
+        return {}
     df = _load_df(conn, "SELECT key, value FROM global_settings")
     return {str(k): str(v) for k, v in zip(df["key"], df["value"])}
 
@@ -137,18 +144,21 @@ def load_portfolio_flows(conn: sqlite3.Connection) -> pd.DataFrame:
 # Holdings & Yahoo helpers
 # -----------------------------
 def _load_trades(conn: sqlite3.Connection) -> pd.DataFrame:
-    if not _table_exists(conn, "trades"): return pd.DataFrame()
+    if not _table_exists(conn, "trades"):
+        return pd.DataFrame()
     df = _load_df(conn, """
         SELECT trade_id, portfolio_id, portfolio_name, ticker, currency, action, quantity, price,
                commission, yahoo_symbol, trade_date, created_at
         FROM trades
     """)
-    for c in ["quantity","price","commission"]:
-        if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    for c in ["quantity", "price", "commission"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
     return df
 
 def _load_portfolios_basic(conn: sqlite3.Connection) -> pd.DataFrame:
-    if not _table_exists(conn, "portfolios"): return pd.DataFrame()
+    if not _table_exists(conn, "portfolios"):
+        return pd.DataFrame()
     return _load_df(conn, "SELECT portfolio_id, portfolio_name, tax_treatment FROM portfolios")
 
 def _aggregate_holdings(trades: pd.DataFrame) -> pd.DataFrame:
@@ -173,10 +183,13 @@ def _fetch_prices(symbols: Iterable[str]) -> Dict[str, Optional[float]]:
     out: Dict[str, Optional[float]] = {}
     for s in symbols:
         key = (s or "").strip()
-        if not key: out[key] = None; continue
+        if not key:
+            out[key] = None
+            continue
         try:
             hist = yf.Ticker(key).history(period="1d", auto_adjust=False, actions=False, raise_errors=False)
-            if hist.empty or "Close" not in hist.columns: out[key] = None
+            if hist.empty or "Close" not in hist.columns:
+                out[key] = None
             else:
                 ser = hist["Close"].dropna()
                 out[key] = float(ser.iloc[-1]) if not ser.empty else None
@@ -188,7 +201,9 @@ def _fetch_currencies(symbols: Iterable[str]) -> Dict[str, Optional[str]]:
     out: Dict[str, Optional[str]] = {}
     for s in symbols:
         key = (s or "").strip()
-        if not key: out[key] = None; continue
+        if not key:
+            out[key] = None
+            continue
         curr = None
         try:
             t = yf.Ticker(key)
@@ -197,8 +212,10 @@ def _fetch_currencies(symbols: Iterable[str]) -> Dict[str, Optional[str]]:
                 curr = fi.currency
             if not curr:
                 info = {}
-                try: info = t.info or {}
-                except Exception: info = {}
+                try:
+                    info = t.info or {}
+                except Exception:
+                    info = {}
                 curr = info.get("currency")
         except Exception:
             curr = None
@@ -207,9 +224,11 @@ def _fetch_currencies(symbols: Iterable[str]) -> Dict[str, Optional[str]]:
 
 def _holdings_to_assets(conn: sqlite3.Connection, valuation: str = "market") -> pd.DataFrame:
     trades = _load_trades(conn)
-    if trades.empty: return pd.DataFrame()
+    if trades.empty:
+        return pd.DataFrame()
     pos = _aggregate_holdings(trades)
-    if pos.empty: return pd.DataFrame()
+    if pos.empty:
+        return pd.DataFrame()
     if valuation.lower() == "market":
         price_map = _fetch_prices(pos["yahoo_symbol"].fillna("").tolist())
         pos["live_price"] = pos["yahoo_symbol"].map(price_map)
@@ -227,9 +246,11 @@ def _holdings_to_assets(conn: sqlite3.Connection, valuation: str = "market") -> 
 def _portfolio_currency_eligible_weight(conn: sqlite3.Connection, valuation: str = "market") -> pd.DataFrame:
     """Per-portfolio CAD weight (0..1). CAD→eligible dividends."""
     trades = _load_trades(conn)
-    if trades.empty: return pd.DataFrame(columns=["portfolio_id","eligible_weight"])
+    if trades.empty:
+        return pd.DataFrame(columns=["portfolio_id","eligible_weight"])
     pos = _aggregate_holdings(trades)
-    if pos.empty: return pd.DataFrame(columns=["portfolio_id","eligible_weight"])
+    if pos.empty:
+        return pd.DataFrame(columns=["portfolio_id","eligible_weight"])
 
     if valuation.lower() == "market":
         price_map = _fetch_prices(pos["yahoo_symbol"].fillna("").tolist())
@@ -257,9 +278,11 @@ def _portfolio_currency_eligible_weight(conn: sqlite3.Connection, valuation: str
 # Flows → schedule
 # -----------------------------
 def _parse_ym(s: Optional[str]) -> Optional[pd.Timestamp]:
-    if not s: return None
+    if not s:
+        return None
     ts = pd.to_datetime(str(s), errors="coerce")
-    if pd.isna(ts): return None
+    if pd.isna(ts):
+        return None
     return ts.normalize().replace(day=1)
 
 def _months_between(d0: pd.Timestamp, d1: pd.Timestamp) -> int:
@@ -278,15 +301,17 @@ def _build_flows_schedule(flows: pd.DataFrame, sim_start: pd.Timestamp, years: i
         idx = int(getattr(r, "index_with_inflation", 1) or 0)
         sd = _parse_ym(getattr(r, "start_date", None))
         ed = _parse_ym(getattr(r, "end_date", None))
-        if amt <= 0 or sd is None: continue
+        if amt <= 0 or sd is None:
+            continue
 
         start_m = max(0, _months_between(sim_start, sd))
         end_m = (horizon - 1) if ed is None else min(horizon - 1, _months_between(sim_start, ed))
-        if end_m < 0 or start_m > (horizon - 1): continue
+        if end_m < 0 or start_m > (horizon - 1):
+            continue
 
         base_contrib = amt if kind == "CONTRIBUTION" else 0.0
         base_withdr = amt if kind == "WITHDRAWAL" else 0.0
-        step_map = {"":1,"monthly":1,"annual":12,"quarterly":3,"semiannual":6}
+        step_map = {"": 1, "monthly": 1, "annual": 12, "quarterly": 3, "semiannual": 6}
         if freq == "once":
             if start_m <= end_m:
                 rows.append({"portfolio_id": pid, "m_idx": start_m, "contrib": base_contrib, "withdraw": base_withdr, "index_flag": idx})
@@ -311,14 +336,14 @@ def _flows_to_monthly_inputs(flows: pd.DataFrame) -> pd.DataFrame:
     f = f[f["frequency"].isin(["monthly","annual","quarterly","semiannual","once"])]
     def _to_m(row) -> float:
         amt = float(row["amount"]); frq = str(row["frequency"])
-        return {"monthly":amt,"annual":amt/12.0,"quarterly":amt/3.0,"semiannual":amt/6.0}.get(frq, 0.0 if frq=="once" else amt)
+        return {"monthly": amt, "annual": amt/12.0, "quarterly": amt/3.0, "semiannual": amt/6.0}.get(frq, 0.0 if frq == "once" else amt)
     f["m_eq"] = f.apply(_to_m, axis=1)
-    contrib = f[f["kind"].str.upper()=="CONTRIBUTION"].groupby("portfolio_id")["m_eq"].sum().rename("monthly_contribution")
-    withd = f[f["kind"].str.upper()=="WITHDRAWAL"].groupby("portfolio_id")["m_eq"].sum().rename("monthly_withdrawal")
+    contrib = f[f["kind"].str.upper() == "CONTRIBUTION"].groupby("portfolio_id")["m_eq"].sum().rename("monthly_contribution")
+    withd = f[f["kind"].str.upper() == "WITHDRAWAL"].groupby("portfolio_id")["m_eq"].sum().rename("monthly_withdrawal")
     infl = f.groupby("portfolio_id")["index_with_inflation"].max().rename("index_with_inflation")
     out = pd.DataFrame({"portfolio_id": sorted(set(f["portfolio_id"].tolist()))})
     out = out.merge(contrib, on="portfolio_id", how="left").merge(withd, on="portfolio_id", how="left").merge(infl, on="portfolio_id", how="left")
-    return out.fillna({"monthly_contribution":0.0,"monthly_withdrawal":0.0,"index_with_inflation":1})
+    return out.fillna({"monthly_contribution": 0.0, "monthly_withdrawal": 0.0, "index_with_inflation": 1})
 
 # -----------------------------
 # Distribution settings
@@ -338,19 +363,8 @@ def _load_portfolio_distribution_settings(conn: sqlite3.Connection) -> pd.DataFr
     """
     Load per-portfolio yield + reinvest flags.
 
-    Supports BOTH the new explicit split fields AND your existing production column names:
-      - eligible split aliases:
-          ['eligible_dividend_yield_annual', 'dividend_yield_eligible_annual', 'div_eligible_yield']
-      - non-eligible split aliases:
-          ['noneligible_dividend_yield_annual', 'dividend_yield_noneligible_annual', 'div_noneligible_yield']
-      - total dividend yield aliases:
-          ['dividend_yield_annual', 'dividend_yield', 'dividend_yield_total']
-      - interest yield aliases:
-          ['interest_yield_annual', 'interest_yield']
-      - reinvest flags:
-          ['reinvest_dividends', 'reinvest_dividend'] and ['reinvest_interest']
-
-    Returns a frame with standardized columns the engine uses:
+    Supports BOTH the new explicit split fields AND existing aliases.
+    Returns standardized columns the engine uses:
       eligible_dividend_yield_annual, noneligible_dividend_yield_annual,
       dividend_yield_annual, interest_yield_annual,
       reinvest_dividends, reinvest_interest, has_explicit_div_split
@@ -371,31 +385,20 @@ def _load_portfolio_distribution_settings(conn: sqlite3.Connection) -> pd.DataFr
 
     cols = _get_table_columns(conn, "portfolios")
 
-    # Resolve actual column names present in your DB
-    elig_col = first_present(cols,
-        "eligible_dividend_yield_annual", "dividend_yield_eligible_annual", "div_eligible_yield"
-    )
-    non_col = first_present(cols,
-        "noneligible_dividend_yield_annual", "dividend_yield_noneligible_annual", "div_noneligible_yield"
-    )
-    div_total_col = first_present(cols,
-        "dividend_yield_annual", "dividend_yield", "dividend_yield_total"
-    )
-    int_col = first_present(cols,
-        "interest_yield_annual", "interest_yield"
-    )
-    reinv_div_col = first_present(cols, "reinvest_dividends", "reinvest_dividend")
-    reinv_int_col = first_present(cols, "reinvest_interest")
+    elig_col = first_present(cols, "eligible_dividend_yield_annual", "dividend_yield_eligible_annual", "div_eligible_yield")
+    non_col  = first_present(cols, "noneligible_dividend_yield_annual", "dividend_yield_noneligible_annual", "div_noneligible_yield")
+    div_tot  = first_present(cols, "dividend_yield_annual", "dividend_yield", "dividend_yield_total")
+    int_col  = first_present(cols, "interest_yield_annual", "interest_yield")
+    reinv_d  = first_present(cols, "reinvest_dividends", "reinvest_dividend")
+    reinv_i  = first_present(cols, "reinvest_interest")
 
     select_cols = ["portfolio_id"]
-    for c in [elig_col, non_col, div_total_col, int_col, reinv_div_col, reinv_int_col]:
+    for c in [elig_col, non_col, div_tot, int_col, reinv_d, reinv_i]:
         if c and c not in select_cols:
             select_cols.append(c)
 
-    # Build SELECT safely
     df = _load_df(conn, f"SELECT {', '.join(select_cols)} FROM portfolios")
 
-    # Create standardized columns (fill missing with defaults)
     def _col(src, default=0.0):
         if src and src in df.columns:
             return df[src]
@@ -405,13 +408,12 @@ def _load_portfolio_distribution_settings(conn: sqlite3.Connection) -> pd.DataFr
         "portfolio_id": df["portfolio_id"],
         "eligible_dividend_yield_annual": _col(elig_col, 0.0),
         "noneligible_dividend_yield_annual": _col(non_col, 0.0),
-        "dividend_yield_annual": _col(div_total_col, 0.0),
+        "dividend_yield_annual": _col(div_tot, 0.0),
         "interest_yield_annual": _col(int_col, 0.0),
-        "reinvest_dividends": _col(reinv_div_col, 0).astype("Int64").fillna(0),
-        "reinvest_interest": _col(reinv_int_col, 0).astype("Int64").fillna(0),
+        "reinvest_dividends": _col(reinv_d, 0).astype("Int64").fillna(0),
+        "reinvest_interest": _col(reinv_i, 0).astype("Int64").fillna(0),
     })
 
-    # Normalize yields: accept 3.27 or 0.0327 → store as decimals
     for ycol in [
         "eligible_dividend_yield_annual",
         "noneligible_dividend_yield_annual",
@@ -420,11 +422,9 @@ def _load_portfolio_distribution_settings(conn: sqlite3.Connection) -> pd.DataFr
     ]:
         out[ycol] = _normalize_yield(out[ycol])
 
-    # Coerce reinvest flags to 0/1 ints
-    out["reinvest_dividends"] = pd.to_numeric(out["reinvest_dividends"], errors="coerce").fillna(0).astype(int).clip(0,1)
-    out["reinvest_interest"]  = pd.to_numeric(out["reinvest_interest"],  errors="coerce").fillna(0).astype(int).clip(0,1)
+    out["reinvest_dividends"] = pd.to_numeric(out["reinvest_dividends"], errors="coerce").fillna(0).astype(int).clip(0, 1)
+    out["reinvest_interest"]  = pd.to_numeric(out["reinvest_interest"],  errors="coerce").fillna(0).astype(int).clip(0, 1)
 
-    # Signal whether an explicit split is available (> 0 on either side)
     out["has_explicit_div_split"] = (
         (out["eligible_dividend_yield_annual"] > 0) |
         (out["noneligible_dividend_yield_annual"] > 0)
@@ -433,83 +433,137 @@ def _load_portfolio_distribution_settings(conn: sqlite3.Connection) -> pd.DataFr
     return out
 
 # -----------------------------
-# Apply distributions
+# Apply distributions (with forward propagation)
 # -----------------------------
 def _apply_div_interest_distributions(monthly_df: pd.DataFrame,
                                       portfolio_settings_df: pd.DataFrame,
                                       elig_weights_df: pd.DataFrame) -> pd.DataFrame:
-    if monthly_df is None or monthly_df.empty: return monthly_df
+    """
+    Adds dividend/interest telemetry and applies reinvestment.
+    Crucially, reinvested amounts are propagated forward using baseline monthly growth factors
+    so the month AFTER a dividend/interest never "drops" solely due to missing propagation.
+    """
+    if monthly_df is None or monthly_df.empty:
+        return monthly_df
+
     df = monthly_df.copy()
-    if "date" not in df.columns: return df
+    if "date" not in df.columns:
+        return df
 
-    df["month"] = pd.to_datetime(df["date"], errors="coerce").dt.month
+    # Sort chronologically to ensure forward propagation is correct
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.sort_values(["portfolio_id", "date"]).reset_index(drop=True)
+    df["month"] = df["date"].dt.month
 
+    # Join per-portfolio settings and CAD-eligible weight
     pset = portfolio_settings_df.copy()
     ew = elig_weights_df.copy() if elig_weights_df is not None else pd.DataFrame(columns=["portfolio_id","eligible_weight"])
-    if "eligible_weight" not in ew.columns: ew["eligible_weight"] = 0.0
+    if "eligible_weight" not in ew.columns:
+        ew["eligible_weight"] = 0.0
     df = df.merge(pset, on="portfolio_id", how="left").merge(ew, on="portfolio_id", how="left")
-    df["eligible_weight"] = pd.to_numeric(df["eligible_weight"], errors="coerce").fillna(0.0).clip(0.0,1.0)
+    df["eligible_weight"] = pd.to_numeric(df["eligible_weight"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
 
-    # Telemetry we persist
-    for c in ["interest_income_base","interest_reinvested_base","cash_flow_from_distributions_base",
-              "eligible_dividend_income_base","noneligible_dividend_income_base",
-              "eligible_dividends_reinvested_base","noneligible_dividends_reinvested_base"]:
-        if c not in df.columns: df[c] = 0.0
+    # Ensure telemetry columns exist (all nominal)
+    for c in [
+        "interest_income_base","interest_reinvested_base","cash_flow_from_distributions_base",
+        "eligible_dividend_income_base","noneligible_dividend_income_base",
+        "eligible_dividends_reinvested_base","noneligible_dividends_reinvested_base"
+    ]:
+        if c not in df.columns:
+            df[c] = 0.0
 
+    # Deflator for month (nominal -> real)
     defl = (pd.to_numeric(df.get("value_nominal", 0.0), errors="coerce") /
-            pd.to_numeric(df.get("value_real", 0.0), errors="coerce")).replace([np.inf,-np.inf], np.nan).fillna(1.0)
+            pd.to_numeric(df.get("value_real", 0.0), errors="coerce")).replace([np.inf, -np.inf], np.nan).fillna(1.0)
 
-    # Process per-portfolio
-    for _, grp in df.groupby("portfolio_id"):
-        idx = grp.index
-        is_div = grp["month"].isin(DIV_MONTHS)
-        is_int = grp["month"].isin(INT_MONTHS)
+    # Pre-compute basic fields
+    is_div = df["month"].isin(DIV_MONTHS)
+    is_int = df["month"].isin(INT_MONTHS)
 
-        val = pd.to_numeric(grp["value_nominal"], errors="coerce").fillna(0.0)
-        rdiv = (pd.to_numeric(grp["reinvest_dividends"], errors="coerce").fillna(0).astype(int) != 0)
-        rint = (pd.to_numeric(grp["reinvest_interest"],  errors="coerce").fillna(0).astype(int) != 0)
+    val_nom = pd.to_numeric(df["value_nominal"], errors="coerce").fillna(0.0)
+    rdiv = (pd.to_numeric(df.get("reinvest_dividends", 0), errors="coerce").fillna(0).astype(int) != 0)
+    rint = (pd.to_numeric(df.get("reinvest_interest", 0), errors="coerce").fillna(0).astype(int) != 0)
 
-        # --- Dividend split source ---
-        has_split = (pd.to_numeric(grp["has_explicit_div_split"], errors="coerce").fillna(0).astype(int) != 0)
-        # yields as decimals
-        elig_y = pd.to_numeric(grp.get("eligible_dividend_yield_annual", 0.0), errors="coerce").fillna(0.0)
-        non_y  = pd.to_numeric(grp.get("noneligible_dividend_yield_annual", 0.0), errors="coerce").fillna(0.0)
-        total_y = pd.to_numeric(grp.get("dividend_yield_annual", 0.0), errors="coerce").fillna(0.0)
-        w = pd.to_numeric(grp.get("eligible_weight", 0.0), errors="coerce").fillna(0.0).clip(0.0,1.0)
+    has_split = (pd.to_numeric(df.get("has_explicit_div_split", 0), errors="coerce").fillna(0).astype(int) != 0)
+    elig_y = pd.to_numeric(df.get("eligible_dividend_yield_annual", 0.0), errors="coerce").fillna(0.0)
+    non_y  = pd.to_numeric(df.get("noneligible_dividend_yield_annual", 0.0), errors="coerce").fillna(0.0)
+    total_y = pd.to_numeric(df.get("dividend_yield_annual", 0.0), errors="coerce").fillna(0.0)
+    w = pd.to_numeric(df.get("eligible_weight", 0.0), errors="coerce").fillna(0.0).clip(0.0, 1.0)
 
-        # If explicit split is provided, ignore weight and use the two yields directly.
-        # Else split the single total yield by CAD weight.
-        D_elig = np.where(is_div,
-                          val * ((np.where(has_split, elig_y, total_y * w)) / 4.0),
-                          0.0)
-        D_non  = np.where(is_div,
-                          val * ((np.where(has_split, non_y, total_y * (1.0 - w))) / 4.0),
-                          0.0)
-        D_total = D_elig + D_non
+    # Dividend split (quarterly)
+    D_elig = np.where(is_div, val_nom * (np.where(has_split, elig_y, total_y * w) / 4.0), 0.0)
+    D_non  = np.where(is_div, val_nom * (np.where(has_split, non_y,  total_y * (1.0 - w)) / 4.0), 0.0)
+    D_total = D_elig + D_non
 
-        # Dividends reinvestment
-        val_after_div = val + np.where(rdiv, D_total, 0.0)
+    # Interest (semiannual) — apply on value after potential divs if both happen in same month
+    # For telemetry, compute interest from end-of-month value BEFORE this post-hoc pass (approx val_nom + reinvested divs)
+    iy = pd.to_numeric(df.get("interest_yield_annual", 0.0), errors="coerce").fillna(0.0)
+    val_after_div = val_nom + np.where(rdiv, D_total, 0.0)
+    I = np.where(is_int, val_after_div * (iy / 2.0), 0.0)
 
-        # Interest (semi-annual) on post-div value
-        iy = pd.to_numeric(grp.get("interest_yield_annual", 0.0), errors="coerce").fillna(0.0)
-        I = np.where(is_int, val_after_div * (iy / 2.0), 0.0)
+    # Telemetry fields (nominal)
+    df["eligible_dividend_income_base"] = D_elig
+    df["noneligible_dividend_income_base"] = D_non
+    df["interest_income_base"] = I
 
-        # Telemetry
-        df.loc[idx, "eligible_dividend_income_base"] = D_elig
-        df.loc[idx, "noneligible_dividend_income_base"] = D_non
-        df.loc[idx, "interest_income_base"] = I
+    df["eligible_dividends_reinvested_base"]   = np.where(rdiv, D_elig, 0.0)
+    df["noneligible_dividends_reinvested_base"] = np.where(rdiv, D_non, 0.0)
+    df["interest_reinvested_base"]             = np.where(rint, I, 0.0)
 
-        df.loc[idx, "eligible_dividends_reinvested_base"]   = np.where(rdiv, D_elig, 0.0)
-        df.loc[idx, "noneligible_dividends_reinvested_base"] = np.where(rdiv, D_non, 0.0)
-        df.loc[idx, "interest_reinvested_base"]             = np.where(rint, I, 0.0)
+    # Cash paid out (negative cash flow) if not reinvested
+    df["cash_flow_from_distributions_base"] = np.where(rdiv, 0.0, D_total) + np.where(rint, 0.0, I)
 
-        df.loc[idx, "cash_flow_from_distributions_base"] = np.where(rdiv, 0.0, D_total) + np.where(rint, 0.0, I)
+    # ---------- Forward propagation ----------
+    # Save baseline nominal/real to derive factors and then add the carried reinvested pool forward.
+    base_nom = pd.to_numeric(df["value_nominal"], errors="coerce").fillna(0.0).values.copy()
+    base_real = pd.to_numeric(df["value_real"], errors="coerce").fillna(0.0).values.copy()
+    contrib = pd.to_numeric(df.get("contributions", 0.0), errors="coerce").fillna(0.0).values
+    withdraw = pd.to_numeric(df.get("withdrawals", 0.0), errors="coerce").fillna(0.0).values
+    # If distributions were previously modeled as cash outflows in baseline, they would be in this column;
+    # our baseline path typically has zero here. Keep it to avoid double counting if present.
+    dist_cash_out = pd.to_numeric(df.get("cash_flow_from_distributions_base", 0.0), errors="coerce").fillna(0.0).values * 0.0
 
-        # Update portfolio values (reinvested amounts raise NAV)
-        val_new = val_after_div + np.where(rint, I, 0.0)
-        df.loc[idx, "value_nominal"] = val_new
-        df.loc[idx, "value_real"] = pd.to_numeric(grp["value_real"], errors="coerce").fillna(0.0) + \
-            (np.where(rdiv, D_total, 0.0) + np.where(rint, I, 0.0)) / defl.loc[idx].replace(0,1.0)
+    # Reinvested nominal this month:
+    reinv_nom = (np.where(rdiv, D_total, 0.0) + np.where(rint, I, 0.0)).astype(float)
+
+    # Compute baseline month-to-month factors: V_t = (V_{t-1} + contrib_t - withdraw_t - dist_cash_out_t) * F_t
+    # => F_t = safe_div(V_t, V_{t-1} + net_flow_t)
+    # First month factor = 1.0
+    factors = np.ones(len(df), dtype=float)
+
+    # Work per portfolio (chronological order already guaranteed)
+    for pid, idx in df.groupby("portfolio_id").indices.items():
+        # indices are contiguous for each portfolio due to sorting
+        ii = np.array(sorted(idx))
+        if len(ii) == 0:
+            continue
+
+        # Baseline factors for this portfolio
+        for k in range(1, len(ii)):
+            t = ii[k]
+            t_prev = ii[k - 1]
+            base_before_growth = base_nom[t_prev] + (contrib[t] - withdraw[t] - dist_cash_out[t])
+            denom = base_before_growth if base_before_growth != 0 else np.nan
+            f = (base_nom[t] / denom) if (denom not in (None, 0, np.nan) and np.isfinite(denom)) else 1.0
+            if not np.isfinite(f) or f <= 0:
+                f = 1.0
+            factors[t] = f
+
+        # Forward carry of reinvested pool
+        carried_pool = 0.0  # nominal dollars of reinvestment accumulated and grown
+        for k in range(len(ii)):
+            t = ii[k]
+            # First, grow prior carried pool by this month's factor
+            if k > 0:
+                carried_pool *= factors[t]
+            # Add this month's new reinvestment
+            carried_pool += float(reinv_nom[t])
+
+            # Updated end-of-month values = baseline + carried_pool
+            df.loc[t, "value_nominal"] = base_nom[t] + carried_pool
+            # Convert the carried pool to real via this month's deflator
+            d = defl.iloc[t] if np.isfinite(defl.iloc[t]) and defl.iloc[t] != 0 else 1.0
+            df.loc[t, "value_real"] = base_real[t] + (carried_pool / d)
 
     df.drop(columns=["month"], inplace=True, errors="ignore")
     return df
@@ -523,8 +577,10 @@ def _constant_macro_df(years: int, growth: float, inflation: float, fx: float) -
 
 def _resolve_sim_start(start_date: Optional[str]) -> pd.Timestamp:
     if start_date:
-        try: return pd.to_datetime(start_date).normalize().replace(day=1)
-        except Exception: pass
+        try:
+            return pd.to_datetime(start_date).normalize().replace(day=1)
+        except Exception:
+            pass
     return pd.Timestamp.today().normalize().replace(day=1)
 
 def run_forecast(
@@ -556,8 +612,10 @@ def run_forecast(
         inputs_df = _flows_to_monthly_inputs(flows_df)
         if not schedule_df.empty and not inputs_df.empty:
             mask = inputs_df["portfolio_id"].isin(set(schedule_df["portfolio_id"].unique()))
-            if "monthly_contribution" in inputs_df.columns: inputs_df.loc[mask, "monthly_contribution"] = 0.0
-            if "monthly_withdrawal"   in inputs_df.columns: inputs_df.loc[mask, "monthly_withdrawal"] = 0.0
+            if "monthly_contribution" in inputs_df.columns:
+                inputs_df.loc[mask, "monthly_contribution"] = 0.0
+            if "monthly_withdrawal" in inputs_df.columns:
+                inputs_df.loc[mask, "monthly_withdrawal"] = 0.0
 
         macro_rates  = get_macro_rates(macro_df, settings, inputs_df)
         infl_factors = build_inflation_factors(macro_rates, settings, inputs_df)
@@ -641,9 +699,12 @@ def _ensure_forecast_run_tables(conn: sqlite3.Connection) -> None:
         conn.commit()
         return
     have = _get_table_columns(conn, "forecast_results_monthly")
-    if set(have) == set(want_cols): return
-    try: old = pd.read_sql("SELECT * FROM forecast_results_monthly", conn)
-    except Exception: old = pd.DataFrame()
+    if set(have) == set(want_cols):
+        return
+    try:
+        old = pd.read_sql("SELECT * FROM forecast_results_monthly", conn)
+    except Exception:
+        old = pd.DataFrame()
     new = pd.DataFrame({c: old[c] if c in old.columns else None for c in want_cols})
     conn.execute("DROP TABLE IF EXISTS forecast_results_monthly_new;")
     conn.executescript("""
@@ -695,13 +756,16 @@ def _ensure_annual_schema(conn: sqlite3.Connection) -> None:
     if not _table_exists(conn, "forecast_results_annual"):
         _create_annual_table(conn, "forecast_results_annual"); conn.commit(); return
     have = _get_table_columns(conn, "forecast_results_annual")
-    if set(have) == set(want_cols): return
-    try: old = pd.read_sql("SELECT * FROM forecast_results_annual", conn)
+    if set(have) == set(want_cols):
+        return
+    try:
+        old = pd.read_sql("SELECT * FROM forecast_results_annual", conn)
     except Exception:
         conn.execute("DROP TABLE IF EXISTS forecast_results_annual;")
         _create_annual_table(conn, "forecast_results_annual"); conn.commit(); return
 
-    def g(col, default=None): return old[col] if col in old.columns else default
+    def g(col, default=None):
+        return old[col] if col in old.columns else default
     new = pd.DataFrame({
         "run_id": g("run_id", 0), "year": g("year", 0), "portfolio_id": g("portfolio_id", 0),
         "portfolio_name": g("portfolio_name", ""), "tax_treatment": g("tax_treatment", ""),
@@ -758,12 +822,14 @@ def _write_results(conn: sqlite3.Connection, run_id: int, monthly_df: pd.DataFra
     m = m.rename(columns={"date":"period","portfolio":"portfolio_name","value_nominal":"nominal_value","value_real":"real_value"})
     base_cols = ["period","portfolio_id","portfolio_name","tax_treatment","nominal_value","real_value","contributions","withdrawals"]
     for col in base_cols:
-        if col not in m.columns: m[col] = None
+        if col not in m.columns:
+            m[col] = None
     telem = ["cash_flow_from_distributions_base","interest_income_base","interest_reinvested_base",
              "eligible_dividend_income_base","noneligible_dividend_income_base",
              "eligible_dividends_reinvested_base","noneligible_dividends_reinvested_base"]
     for c in telem:
-        if c not in m.columns: m[c] = 0.0
+        if c not in m.columns:
+            m[c] = 0.0
     m["run_id"] = run_id
     m_cols = ["run_id"] + base_cols + telem
     m[m_cols].to_sql("forecast_results_monthly", conn, if_exists="append", index=False)
@@ -774,21 +840,24 @@ def _write_results(conn: sqlite3.Connection, run_id: int, monthly_df: pd.DataFra
         a = pd.DataFrame(columns=["year","portfolio_id","portfolio","tax_treatment","after_tax","after_tax_real","taxes"])
     a = a.rename(columns={"portfolio":"portfolio_name","after_tax":"after_tax_income","after_tax_real":"real_after_tax_income","taxes":"taxes_paid"})
     for col in ["year","portfolio_id","portfolio_name","tax_treatment","after_tax_income","real_after_tax_income","taxes_paid"]:
-        if col not in a.columns: a[col] = None
+        if col not in a.columns:
+            a[col] = None
 
     mm = monthly_df.copy()
     mm["year"] = pd.to_datetime(mm["date"]).dt.year
     defl = (pd.to_numeric(mm["value_nominal"], errors="coerce") / pd.to_numeric(mm["value_real"], errors="coerce")).replace([np.inf,-np.inf], np.nan).fillna(1.0)
     mm["_defl"] = defl
     for fld in ["contributions","withdrawals"]:
-        if fld not in mm.columns: mm[fld] = 0.0
+        if fld not in mm.columns:
+            mm[fld] = 0.0
         mm[f"{fld}_real"] = pd.to_numeric(mm[fld], errors="coerce").fillna(0.0) / mm["_defl"].replace(0,1.0)
 
     dist_cols = ["interest_income_base","interest_reinvested_base",
                  "eligible_dividend_income_base","noneligible_dividend_income_base",
                  "eligible_dividends_reinvested_base","noneligible_dividends_reinvested_base"]
     for dc in dist_cols:
-        if dc not in mm.columns: mm[dc] = 0.0
+        if dc not in mm.columns:
+            mm[dc] = 0.0
     dist_annual = mm.groupby(["year","portfolio_id"], as_index=False)[dist_cols].sum()
 
     flows_real = (mm.groupby(["year","portfolio_id"], as_index=False)[["contributions_real","withdrawals_real"]].sum()
