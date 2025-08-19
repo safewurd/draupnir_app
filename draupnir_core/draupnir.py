@@ -281,11 +281,10 @@ def apply_taxes(
 ) -> pd.DataFrame:
     """
     Annual, per-portfolio:
-      - 'portfolio income' = sum of withdrawals in calendar year
-      - adds employment income (optional)
-      - computes nominal after-tax income, real after-tax income (deflated),
-        and taxes_paid.
-    Returns columns:
+      pretax income = withdrawals + (non‑reinvested distributions) + employment
+      taxes = sum of taxes on each component (withdrawals by tax_treatment,
+              interest, eligible div, non-eligible div, employment)
+    Returns:
       [year, portfolio_id, portfolio_name, tax_treatment,
        after_tax_income, real_after_tax_income, taxes_paid]
     """
@@ -295,19 +294,19 @@ def apply_taxes(
             "after_tax_income","real_after_tax_income","taxes_paid"
         ])
 
-    # Employment income map by calendar year
+    # Employment income map (calendar year -> amount)
     emp_map: Dict[int, float] = {}
     if isinstance(employment_income, dict):
         emp_map = {int(k): float(v) for k, v in employment_income.items()}
-    elif (employment_income is not None) and isinstance(employment_income, pd.DataFrame) and not employment_income.empty:
-        df = employment_income.copy()
-        ycol = "year" if "year" in df.columns else df.columns[0]
-        acol = "amount" if "amount" in df.columns else df.columns[1]
-        df[ycol] = pd.to_numeric(df[ycol], errors="coerce").astype("Int64")
-        df[acol] = pd.to_numeric(df[acol], errors="coerce").fillna(0.0)
-        emp_map = {int(r[ycol]): float(r[acol]) for _, r in df.iterrows() if pd.notna(r[ycol])}
+    elif isinstance(employment_income, pd.DataFrame) and not employment_income.empty:
+        df_emp = employment_income.copy()
+        ycol = "year" if "year" in df_emp.columns else df_emp.columns[0]
+        acol = "amount" if "amount" in df_emp.columns else df_emp.columns[1]
+        df_emp[ycol] = pd.to_numeric(df_emp[ycol], errors="coerce").astype("Int64")
+        df_emp[acol] = pd.to_numeric(df_emp[acol], errors="coerce").fillna(0.0)
+        emp_map = {int(r[ycol]): float(r[acol]) for _, r in df_emp.iterrows() if pd.notna(r[ycol])}
 
-    # CPI accumulation (annual)
+    # CPI for deflation (annual)
     macro_norm = _normalize_macro_df(macro)
     cpi_step = {int(r["year"]): float(1.0 + r["inflation"]) for _, r in macro_norm.iterrows()}
     cum_cpi: Dict[int, float] = {}
@@ -317,33 +316,62 @@ def apply_taxes(
         cum_cpi[y] = acc
 
     m = monthly_df.copy()
-    m["year"] = m["date"].dt.year
+    m["year"] = pd.to_datetime(m["date"]).dt.year
     y0 = int(m["year"].min())
     m["y_idx"] = m["year"] - y0
 
-    # Portfolio income = sum of withdrawals in each calendar year
-    agg = (m.groupby(["y_idx","portfolio_id","portfolio_name","tax_treatment"], dropna=False)["withdrawals"]
-             .sum()
-             .reset_index()
-             .rename(columns={"withdrawals":"portfolio_income_pre"}))
+    # Ensure telemetry columns exist
+    for col in [
+        "contributions","withdrawals",
+        "interest_income_base","interest_reinvested_base",
+        "eligible_dividend_income_base","noneligible_dividend_income_base",
+        "eligible_dividends_reinvested_base","noneligible_dividends_reinvested_base",
+    ]:
+        if col not in m.columns:
+            m[col] = 0.0
+
+    # Annual per-portfolio aggregation
+    grp = (m.groupby(["y_idx","portfolio_id","portfolio_name","tax_treatment"], dropna=False)
+             .agg(
+                 withdrawals=("withdrawals","sum"),
+                 interest_income=("interest_income_base","sum"),
+                 interest_reinvested=("interest_reinvested_base","sum"),
+                 elig_div_income=("eligible_dividend_income_base","sum"),
+                 elig_div_reinv=("eligible_dividends_reinvested_base","sum"),
+                 nonelig_div_income=("noneligible_dividend_income_base","sum"),
+                 nonelig_div_reinv=("noneligible_dividends_reinvested_base","sum"),
+             )
+             .reset_index())
 
     records = []
-    for _, r in agg.iterrows():
+    for _, r in grp.iterrows():
         y     = int(r["y_idx"])
         pid   = int(r["portfolio_id"])
         pname = str(r["portfolio_name"])
         tt    = str(r["tax_treatment"] or "TAXABLE").upper()
 
-        port_income_nom = float(r["portfolio_income_pre"])
+        # Cash distributions that are taxable this year (exclude reinvested)
+        taxable_interest   = max(0.0, float(r["interest_income"]   - r["interest_reinvested"]))
+        taxable_elig_div   = max(0.0, float(r["elig_div_income"]   - r["elig_div_reinv"]))
+        taxable_nonelig_div= max(0.0, float(r["nonelig_div_income"]- r["nonelig_div_reinv"]))
+
+        # Withdrawals and employment
+        withdrawals_nom = float(r["withdrawals"])
         emp_nom = float(emp_map.get(y0 + y, 0.0))
 
-        # Taxes on portfolio income (by tax_treatment) + employment
-        tax_port = calculate_annual_tax(tax_rules_conn, port_income_nom, tt,         year=(y0 + y))
-        tax_emp  = calculate_annual_tax(tax_rules_conn, emp_nom,           "EMPLOYMENT", year=(y0 + y))
-        taxes = round(tax_port + tax_emp, 2)
+        # ---- Taxes by component ----
+        tax_withdrawals = calculate_annual_tax(tax_rules_conn, withdrawals_nom, tt, year=(y0 + y))
+        tax_interest    = calculate_annual_tax(tax_rules_conn, taxable_interest, "INTEREST", year=(y0 + y))
+        tax_elig        = calculate_annual_tax(tax_rules_conn, taxable_elig_div, "ELIGIBLE_DIVIDEND", year=(y0 + y))
+        tax_nonelig     = calculate_annual_tax(tax_rules_conn, taxable_nonelig_div, "NONELIGIBLE_DIVIDEND", year=(y0 + y))
+        tax_emp         = calculate_annual_tax(tax_rules_conn, emp_nom, "EMPLOYMENT", year=(y0 + y))
 
-        after_tax_nom = round(port_income_nom + emp_nom - taxes, 2)
-        disc = float(cum_cpi.get(y, 1.0))
+        taxes = round(tax_withdrawals + tax_interest + tax_elig + tax_nonelig + tax_emp, 2)
+
+        pretax_nom = withdrawals_nom + taxable_interest + taxable_elig_div + taxable_nonelig_div + emp_nom
+        after_tax_nom = round(pretax_nom - taxes, 2)
+
+        disc = float(cum_cpi.get(y, 1.0))  # deflate to real
         after_tax_real = round(after_tax_nom / disc, 2)
 
         records.append({
